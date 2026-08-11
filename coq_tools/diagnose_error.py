@@ -253,6 +253,7 @@ def has_error(
 
 TIMEOUT_POSTFIX = "\nTimeout! (external)"
 MEMORY_LIMIT_POSTFIXES = (
+    "\nFatal error: Not enough heap memory to reserve minor heaps",
     "\nFatal error: not enough memory",
     "\nFatal error: out of memory.",
     "\nFatal error: out of memory",
@@ -269,7 +270,10 @@ def is_timeout(output):
 def is_memory_limit(output):
     """Returns True if the output was killed because of a memory limit, False otherwise"""
     output = output.strip()
-    return any(output.endswith(postfix) for postfix in MEMORY_LIMIT_POSTFIXES)
+    return any(
+        output.endswith(postfix) or output == postfix.lstrip("\n")
+        for postfix in MEMORY_LIMIT_POSTFIXES
+    )
 
 
 def adjust_error_message_for_selected_errors(

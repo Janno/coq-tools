@@ -582,3 +582,14 @@ def test_native_debug_probe_cache_includes_executable_identity(tmp_path):
     assert first == ["-d", "native-compiler"]
     assert second == ["-debug"]
     assert cached_second == second
+
+
+def test_ocaml_minor_heap_oom_is_a_memory_limit():
+    output = "Fatal error: Not enough heap memory to reserve minor heaps"
+    assert diagnose_error.is_memory_limit(output)
+
+    adjusted = diagnose_error.adjust_error_message_for_selected_errors(
+        output, file_name="oom.v", line_number=7, characters="1-2"
+    )
+    assert 'File "oom.v", line 7, characters 1-2:' in adjusted
+    assert "Error:\nFatal error: Not enough heap memory" in adjusted

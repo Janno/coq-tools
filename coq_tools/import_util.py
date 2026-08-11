@@ -1,5 +1,6 @@
 from __future__ import print_function, with_statement
 
+import errno
 import glob
 import os
 import os.path
@@ -850,9 +851,15 @@ def make_one_glob_file_helper(
                 try:
                     # N.B. We need shutil.move rather than os.rename because the source and destination may be on different filesystems
                     shutil.move(tmp_glob_file, glob_file)
-                except PermissionError as e:
+                except OSError as e:
+                    if (
+                        e.errno not in (errno.EACCES, errno.EPERM, errno.EROFS)
+                        or is_local(glob_file)
+                        or not os.path.exists(glob_file)
+                    ):
+                        raise
                     kwargs["log"](
-                        f"Failed to move '{tmp_glob_file}' to '{glob_file}' ({e}), assuming that '{glob_file}' is up to date"
+                        f"Failed to move '{tmp_glob_file}' to installed glob '{glob_file}' ({e}), using the existing glob"
                     )
         elif os.path.exists(tmp_glob_file):
             kwargs["log"](

@@ -17,6 +17,13 @@ cd "$DIR/$EXAMPLE_DIRECTORY"
 # Initialize common settings like the version of python
 . "$DIR/init-settings.sh"
 
+# OCaml 5 reserves minor-heap address space for 128 domains by default.  That
+# reservation alone exceeds this example's intentional 1G address-space limit,
+# so keep the test focused on the candidate's allocation.
+if coqc --version 2>&1 | "$GREP" -q 'OCaml 5\.'; then
+    export OCAMLRUNPARAM="${OCAMLRUNPARAM:+${OCAMLRUNPARAM},}d=1"
+fi
+
 
 # Set up bash to be verbose about displaying the commands run
 PS4='$ '
@@ -41,6 +48,7 @@ set -x
 { EXPECTED_ERROR=$(cat); } <<EOF
 File "[^"]*\.v", line [0-9-]\+, characters [0-9-]\+:
 Error:\( Out of memory.\?\|
+Fatal error: Not enough heap memory to reserve minor heaps\|
 Fatal error: not enough memory\|
 Fatal error: out of memory.\?\)
 EOF
