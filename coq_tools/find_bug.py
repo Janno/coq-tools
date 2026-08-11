@@ -13,6 +13,16 @@ from . import custom_arguments, split_definitions, util
 from .admit_abstract import transform_abstract_to_admit
 from .argparse_compat import argparse
 from .binding_util import process_maybe_list
+from .candidate_evaluator import (
+    CandidateCheckCoordinator,
+    CandidateDecision,
+    CoqcEvaluator,
+    EnvironmentSnapshot,
+    EvaluationContextSpec,
+    EvaluationVerdict,
+    LegacyTargetPolicy,
+    ResourceRequest,
+)
 from .coq_running_support import (
     get_default_options_settings,
     get_ltac_support_snippet,
@@ -90,6 +100,10 @@ from .util import (
 if PY3:
     raw_input = util.raw_input
 from . import diagnose_error
+
+# Deliberate legacy executor calls remain for interactive target discovery,
+# locating the current error line before trailing-source stripping, and import
+# runtime measurement.  Candidate checks themselves use candidate_evaluator.
 
 __all__ = ["main"]
 
@@ -1295,15 +1309,77 @@ CONTENTS_UNCHANGED, CHANGE_SUCCESS, CHANGE_FAILURE = (
 )
 
 
+def _candidate_context_spec(logical_file_name, passing=False, **kwargs):
+    """Build one role's immutable spec from the effective request kwargs."""
+    prefix = "passing_" if passing else ""
+    executable = kwargs[prefix + "coqc"]
+    arguments = kwargs[prefix + "coqc_args"]
+    timeout_key = prefix + "timeout" if passing else "timeout"
+    cwd_key = prefix + "base_dir" if passing else "base_dir"
+    ocamlpath_key = "passing_ocamlpath" if passing else "nonpassing_ocamlpath"
+    toplevel_key = prefix + "coqc_is_coqtop"
+    checker_key = prefix + "coqchk"
+    checker_arguments_key = prefix + "coqchk_args"
+    memory_usage_key = (
+        kwargs["memory_usage_key"]
+        if "memory_usage_key" in kwargs
+        else tuple(executable)
+    )
+    resource_request = ResourceRequest(
+        kwargs[timeout_key],
+        kwargs.get("max_mem_rss"),
+        kwargs.get("max_mem_as"),
+        kwargs.get("max_mem_rss_multiplier"),
+        kwargs.get("max_mem_as_multiplier"),
+        kwargs.get("mem_limit_method", "prlimit"),
+        kwargs.get("cgroup"),
+        memory_usage_key,
+    )
+    environment = EnvironmentSnapshot(
+        dict(os.environ), ocamlpath=kwargs.get(ocamlpath_key)
+    )
+    return EvaluationContextSpec(
+        executable,
+        arguments,
+        cwd=kwargs.get(cwd_key),
+        environment=environment,
+        logical_file=logical_file_name,
+        is_toplevel=kwargs.get(toplevel_key, False),
+        pass_on_stdin=kwargs.get(prefix + "pass_on_stdin", False),
+        checker_executable=kwargs.get(checker_key),
+        checker_arguments=kwargs.get(checker_arguments_key, ()),
+        resource_request=resource_request,
+    )
+
+
+def _discard_candidate_preserving_active_exception(
+    coordinator, attempt, log, description
+):
+    """Best-effort discard without masking the exception already in flight."""
+    try:
+        coordinator.discard_candidate(attempt)
+    except BaseException:
+        cleanup_traceback = traceback.format_exc()
+        try:
+            log(
+                "Non-fatal error while discarding %s:\n%s"
+                % (description, cleanup_traceback),
+                level=LOG_ALWAYS,
+            )
+        except BaseException:
+            pass
+
+
 def classify_contents_change(
     old_contents,
     new_contents,
     ignore_coq_output_cache=False,
     reset_timeout=False,
     should_succeed: bool = False,
+    logical_file_name=None,
     **kwargs,
 ):
-    # returns (RESULT_TYPE, PADDED_CONTENTS, OUTPUT_LIST, option BAD_INDEX, DESCRIPTION_OF_FAILURE_MODE, RUNTIME, EXTRA_VERBOSE_DESCRIPTION_OF_FAILURE_MODE_TUPLE_LIST)
+    """Classify raw candidate source and return a named transaction decision."""
     kwargs["header_dict"] = kwargs.get(
         "header_dict",
         get_header_dict(
@@ -1311,148 +1387,55 @@ def classify_contents_change(
         ),
     )
 
-    # this is a function, so that once we update the header dict with the runtime, we get the right header
-    def get_padded_contents():
-        return prepend_header(new_contents, **kwargs)
-
     if new_contents == old_contents:
-        return (
+        verdict = EvaluationVerdict(
             CONTENTS_UNCHANGED,
-            get_padded_contents(),
-            tuple(),
+            (),
             None,
             "No change.  ",
             None,
-            [],
+            None,
+            (),
+            None,
+        )
+        return CandidateDecision(
+            new_contents, prepend_header(new_contents, **kwargs), verdict
         )
 
-    if reset_timeout:
-        diagnose_error.reset_timeout()
-    if ignore_coq_output_cache:
-        diagnose_error.reset_coq_output_cache(
-            kwargs["coqc"],
-            kwargs["coqc_args"],
-            new_contents,
-            kwargs["timeout"],
-            cwd=kwargs["base_dir"],
-            is_coqtop=kwargs["coqc_is_coqtop"],
-            verbose_base=2,
-            ocamlpath=kwargs["nonpassing_ocamlpath"],
-            **kwargs,
-        )
-    output, cmds, retcode, runtime, peak_rss_kb = diagnose_error.get_coq_output(
-        kwargs["coqc"],
-        kwargs["coqc_args"],
-        new_contents,
-        kwargs["timeout"],
-        cwd=kwargs["base_dir"],
-        is_coqtop=kwargs["coqc_is_coqtop"],
-        verbose_base=2,
-        ocamlpath=kwargs["nonpassing_ocamlpath"],
-        coqchk_prog=kwargs["coqchk"],
-        coqchk_prog_args=kwargs["coqchk_args"],
-        **kwargs,
+    coordinator = kwargs["candidate_check_coordinator"]
+    primary_spec = _candidate_context_spec(
+        logical_file_name, passing=False, **kwargs
     )
-    if not should_succeed and diagnose_error.has_error(
-        output, kwargs["error_reg_string"]
-    ):
-        if kwargs["passing_coqc"]:
-            if ignore_coq_output_cache:
-                diagnose_error.reset_coq_output_cache(
-                    kwargs["passing_coqc"],
-                    kwargs["passing_coqc_args"],
-                    new_contents,
-                    kwargs["passing_timeout"],
-                    cwd=kwargs["passing_base_dir"],
-                    is_coqtop=kwargs["passing_coqc_is_coqtop"],
-                    verbose_base=2,
-                    ocamlpath=kwargs["passing_ocamlpath"],
-                    **kwargs,
-                )
-            (
-                passing_output,
-                cmds,
-                passing_retcode,
-                passing_runtime,
-                passing_peak_rss_kb,
-            ) = diagnose_error.get_coq_output(
-                kwargs["passing_coqc"],
-                kwargs["passing_coqc_args"],
-                new_contents,
-                kwargs["passing_timeout"],
-                cwd=kwargs["passing_base_dir"],
-                is_coqtop=kwargs["passing_coqc_is_coqtop"],
-                verbose_base=2,
-                ocamlpath=kwargs["passing_ocamlpath"],
-                coqchk_prog=kwargs["passing_coqchk"],
-                coqchk_prog_args=kwargs["passing_coqchk_args"],
-                **kwargs,
-            )
-            if not (
-                diagnose_error.has_error(passing_output)
-                or diagnose_error.is_timeout(passing_output)
-            ):
-                # we return passing_runtime, under the presumption
-                # that in Coq's test-suite, the file should pass, and
-                # so this is a better indicator of how long it'll take
-                kwargs["header_dict"]["recent_runtime"] = passing_runtime
-                kwargs["header_dict"]["recent_peak_rss_kb"] = passing_peak_rss_kb
-                return (
-                    CHANGE_SUCCESS,
-                    get_padded_contents(),
-                    (output, passing_output),
-                    None,
-                    "Change successful.  ",
-                    passing_runtime,
-                    [],
-                )
-            else:
-                return (
-                    CHANGE_FAILURE,
-                    get_padded_contents(),
-                    (output, passing_output),
-                    1,
-                    "The alternate coqc (%s) was supposed to pass, but instead emitted an error.  "
-                    % kwargs["passing_coqc"],
-                    runtime,
-                    [],
-                )
-        else:
-            kwargs["header_dict"]["recent_runtime"] = runtime
-            kwargs["header_dict"]["recent_peak_rss_kb"] = peak_rss_kb
-            return (
-                CHANGE_SUCCESS,
-                get_padded_contents(),
-                (output,),
-                None,
-                "Change successful.  ",
-                runtime,
-                [],
-            )
-    elif should_succeed and not diagnose_error.has_error(output):
-        kwargs["header_dict"]["recent_runtime"] = runtime
-        kwargs["header_dict"]["recent_peak_rss_kb"] = peak_rss_kb
-        return (
-            CHANGE_SUCCESS,
-            get_padded_contents(),
-            (output,),
-            None,
-            "Change successful.  ",
-            runtime,
-            [],
+    passing_spec = (
+        _candidate_context_spec(logical_file_name, passing=True, **kwargs)
+        if kwargs.get("passing_coqc")
+        else None
+    )
+    target_policy = LegacyTargetPolicy(
+        should_succeed, kwargs.get("error_reg_string")
+    )
+    verdict = coordinator.begin_candidate(
+        new_contents,
+        primary_spec,
+        passing_spec,
+        target_policy,
+        bypass_cache=ignore_coq_output_cache,
+        reset_calibration=reset_timeout,
+    )
+    try:
+        if verdict.result_type == CHANGE_SUCCESS:
+            kwargs["header_dict"]["recent_runtime"] = verdict.runtime
+            kwargs["header_dict"]["recent_peak_rss_kb"] = verdict.peak_rss_kb
+        serialized_contents = prepend_header(new_contents, **kwargs)
+    except BaseException:
+        _discard_candidate_preserving_active_exception(
+            coordinator,
+            verdict.attempt,
+            kwargs["log"],
+            "a serialization-failed candidate",
         )
-    else:
-        extra_desc = ""
-        extra_desc_list = [(2, "The error was:\n%s\n" % output)]
-        return (
-            CHANGE_FAILURE,
-            get_padded_contents(),
-            (output,),
-            0,
-            extra_desc,
-            runtime,
-            extra_desc_list,
-        )
+        raise
+    return CandidateDecision(new_contents, serialized_contents, verdict)
 
 
 def check_change_and_write_to_file(
@@ -1475,79 +1458,181 @@ def check_change_and_write_to_file(
     **kwargs,
 ):
     kwargs["log"](
-        'Running coq on the file\n"""\n%s\n"""' % new_contents, level=2 + verbose_base
+        'Running coq on the file\n"""\n%s\n"""' % new_contents,
+        level=2 + verbose_base,
     )
-    (
-        change_result,
-        contents,
-        outputs,
-        output_i,
-        error_desc,
-        runtime,
-        error_desc_verbose_list,
-    ) = classify_contents_change(
+    decision = classify_contents_change(
         old_contents,
         new_contents,
         ignore_coq_output_cache=ignore_coq_output_cache,
+        logical_file_name=output_file_name,
         **kwargs,
     )
-    if change_result == CONTENTS_UNCHANGED:
+    coordinator = kwargs["candidate_check_coordinator"]
+
+    if decision.result_type == CONTENTS_UNCHANGED:
         kwargs["log"]("\n%s" % unchanged_message, level=verbose_base)
         return False
-    elif change_result == CHANGE_SUCCESS:
-        kwargs["log"](
-            util.color(
-                "\n%s" % success_message, util.colors.OKGREEN, kwargs["color_on"]
-            ),
-            level=verbose_base,
-        )
-        write_to_file_or_shorten_name(output_file_name, contents)
-        return True
-    elif change_result == CHANGE_FAILURE:
-        kwargs["log"](
-            "\nNon-fatal error: Failed to %s and preserve the error.  %s"
-            % (failure_description, error_desc),
-            level=verbose_base,
-        )
-        for lvl, msg in error_desc_verbose_list:
-            kwargs["log"](msg, level=lvl)
-        if write_to_temp_file and not kwargs["remove_temp_file"]:
-            kwargs["log"](
-                "Writing %s to %s (log in %s)."
-                % (
-                    changed_description.lower(),
-                    kwargs["temp_file_name"],
-                    kwargs["temp_file_log_name"],
-                ),
-                level=verbose_base,
-            )
-        kwargs["log"]("The new error was:", level=verbose_base)
-        kwargs["log"](outputs[output_i], level=verbose_base)
-        kwargs["log"]("All Outputs:\n%s" % "\n".join(outputs), level=verbose_base + 2)
-        if write_to_temp_file and not kwargs["remove_temp_file"]:
-            kwargs["temp_file_name"] = write_to_file_or_shorten_name(
-                kwargs["temp_file_name"],
-                contents,
-            )
-            kwargs["temp_file_log_name"] = write_to_file_or_shorten_name(
-                kwargs["temp_file_log_name"],
-                outputs[output_i],
-            )
-        else:
+
+    if decision.result_type == CHANGE_SUCCESS:
+        try:
             kwargs["log"](
                 util.color(
-                    "%s not saved." % changed_description,
-                    util.colors.WARNING,
+                    "\n%s" % success_message,
+                    util.colors.OKGREEN,
                     kwargs["color_on"],
                 ),
                 level=verbose_base,
             )
-        if timeout_retry_count > 1 and diagnose_error.is_timeout(outputs[output_i]):
+            written_path = write_to_file_or_shorten_name(
+                output_file_name, decision.serialized_contents
+            )
+        except BaseException:
+            _discard_candidate_preserving_active_exception(
+                coordinator,
+                decision.attempt,
+                kwargs["log"],
+                "a pre-commit candidate",
+            )
+            raise
+        coordinator.commit_candidate(
+            decision.attempt,
+            serialized_contents=decision.serialized_contents,
+            output_file_name=written_path,
+        )
+        return True
+
+    if decision.result_type == CHANGE_FAILURE:
+        outputs = decision.outputs
+        output_i = decision.bad_output_index
+        should_retry = False
+        try:
             kwargs["log"](
-                "\nRetrying another %d time%s..."
-                % (timeout_retry_count - 1, "s" if timeout_retry_count > 2 else ""),
+                "\nNon-fatal error: Failed to %s and preserve the error.  %s"
+                % (failure_description, decision.description),
                 level=verbose_base,
             )
+            for lvl, msg in decision.verbose_descriptions:
+                kwargs["log"](msg, level=lvl)
+            if write_to_temp_file and not kwargs["remove_temp_file"]:
+                kwargs["log"](
+                    "Writing %s to %s (log in %s)."
+                    % (
+                        changed_description.lower(),
+                        kwargs["temp_file_name"],
+                        kwargs["temp_file_log_name"],
+                    ),
+                    level=verbose_base,
+                )
+            kwargs["log"]("The new error was:", level=verbose_base)
+            kwargs["log"](outputs[output_i], level=verbose_base)
+            kwargs["log"](
+                "All Outputs:\n%s" % "\n".join(outputs),
+                level=verbose_base + 2,
+            )
+            # Preserve the historical ordering: rejected source and log copies
+            # are written before a selected timeout is retried.
+            if write_to_temp_file and not kwargs["remove_temp_file"]:
+                kwargs["temp_file_name"] = write_to_file_or_shorten_name(
+                    kwargs["temp_file_name"], decision.serialized_contents
+                )
+                kwargs["temp_file_log_name"] = write_to_file_or_shorten_name(
+                    kwargs["temp_file_log_name"], outputs[output_i]
+                )
+            else:
+                kwargs["log"](
+                    util.color(
+                        "%s not saved." % changed_description,
+                        util.colors.WARNING,
+                        kwargs["color_on"],
+                    ),
+                    level=verbose_base,
+                )
+            should_retry = (
+                timeout_retry_count > 1
+                and diagnose_error.is_timeout(outputs[output_i])
+            )
+            if should_retry:
+                kwargs["log"](
+                    "\nRetrying another %d time%s..."
+                    % (
+                        timeout_retry_count - 1,
+                        "s" if timeout_retry_count > 2 else "",
+                    ),
+                    level=verbose_base,
+                )
+            else:
+                if diagnose_error.has_error(outputs[output_i]):
+                    new_line = diagnose_error.get_error_line_number(
+                        outputs[output_i]
+                    )
+                    new_start, new_end = diagnose_error.get_error_byte_locations(
+                        outputs[output_i]
+                    )
+                    new_contents_lines = new_contents.split("\n")
+                    new_contents_to_error, new_contents_rest = (
+                        "\n".join(new_contents_lines[: new_line - 1]),
+                        "\n".join(new_contents_lines[new_line - 1 :]),
+                    )
+                    source_display = "%s\n%s\n" % (
+                        new_contents_to_error,
+                        new_contents_rest.encode("utf-8")[:new_end].decode(
+                            "utf-8"
+                        ),
+                    )
+                else:
+                    source_display = new_contents
+                error_key = re.sub(
+                    r'File "[^"]+"', r'File ""', outputs[output_i]
+                )
+                if (
+                    display_extra_verbose_on_error
+                    and error_key not in skip_extra_verbose_error_state
+                ):
+                    skip_extra_verbose_error_state.add(error_key)
+                    kwargs["log"](
+                        "%s%s"
+                        % (
+                            extra_verbose_prefix,
+                            (
+                                "%sFailed to %s and preserve the error.  %s\nThe new error was:\n%s\n\nThe file generating the error was:\n%s"
+                                % (
+                                    extra_verbose_prefix,
+                                    failure_description,
+                                    decision.description,
+                                    outputs[output_i],
+                                    source_display,
+                                )
+                            )
+                            .replace("\r\n", "\n")
+                            .replace("\n", extra_verbose_newline),
+                        ),
+                        level=verbose_base,
+                    )
+                if display_source_to_error:
+                    kwargs["log"](
+                        "The file generating the error was:", level=verbose_base
+                    )
+                    kwargs["log"](source_display, level=verbose_base)
+        finally:
+            active_exception = sys.exc_info()[0] is not None
+            try:
+                coordinator.discard_candidate(decision.attempt)
+            except BaseException:
+                if active_exception:
+                    discard_traceback = traceback.format_exc()
+                    try:
+                        kwargs["log"](
+                            "Non-fatal error while discarding a rejected candidate:\n%s"
+                            % discard_traceback,
+                            level=LOG_ALWAYS,
+                        )
+                    except BaseException:
+                        pass
+                else:
+                    raise
+
+        if should_retry:
             return check_change_and_write_to_file(
                 old_contents,
                 new_contents,
@@ -1563,73 +1648,20 @@ def check_change_and_write_to_file(
                 display_extra_verbose_on_error=display_extra_verbose_on_error,
                 **kwargs,
             )
-        else:
-            if diagnose_error.has_error(outputs[output_i]):
-                new_line = diagnose_error.get_error_line_number(outputs[output_i])
-                new_start, new_end = diagnose_error.get_error_byte_locations(
-                    outputs[output_i]
-                )
-                new_contents_lines = new_contents.split("\n")
-                new_contents_to_error, new_contents_rest = (
-                    "\n".join(new_contents_lines[: new_line - 1]),
-                    "\n".join(new_contents_lines[new_line - 1 :]),
-                )
-                source_display = "%s\n%s\n" % (
-                    new_contents_to_error,
-                    new_contents_rest.encode("utf-8")[:new_end].decode("utf-8"),
-                )
-            else:
-                source_display = new_contents
-            error_key = re.sub(r'File "[^"]+"', r'File ""', outputs[output_i])
-            if (
-                display_extra_verbose_on_error
-                and error_key not in skip_extra_verbose_error_state
-            ):
-                skip_extra_verbose_error_state.add(error_key)
-                kwargs["log"](
-                    "%s%s"
-                    % (
-                        extra_verbose_prefix,
-                        (
-                            "%sFailed to %s and preserve the error.  %s\nThe new error was:\n%s\n\nThe file generating the error was:\n%s"
-                            % (
-                                extra_verbose_prefix,
-                                failure_description,
-                                error_desc,
-                                outputs[output_i],
-                                source_display,
-                            )
-                        )
-                        .replace("\r\n", "\n")
-                        .replace("\n", extra_verbose_newline),
-                    ),
-                    level=verbose_base,
-                )
-            if display_source_to_error:
-                kwargs["log"]("The file generating the error was:", level=verbose_base)
-                kwargs["log"](source_display, level=verbose_base)
         return False
-    else:
-        kwargs["log"](
-            "ERROR: Unrecognized change result %s on\nclassify_contents_change(\n  %s\n ,%s\n)\n%s"
-            % (
-                change_result,
-                repr(old_contents),
-                repr(new_contents),
-                repr(
-                    (
-                        change_result,
-                        contents,
-                        outputs,
-                        output_i,
-                        error_desc,
-                        runtime,
-                        error_desc_verbose_list,
-                    )
-                ),
-            ),
-            level=LOG_ALWAYS,
-        )
+
+    if decision.attempt is not None:
+        coordinator.discard_candidate(decision.attempt)
+    kwargs["log"](
+        "ERROR: Unrecognized change result %s on\nclassify_contents_change(\n  %s\n ,%s\n)\n%s"
+        % (
+            decision.result_type,
+            repr(old_contents),
+            repr(new_contents),
+            repr(decision),
+        ),
+        level=LOG_ALWAYS,
+    )
     return None
 
 
@@ -4507,6 +4539,7 @@ def main():
         "mem_limit_method": args.mem_limit_method,
         "minimize_args": args.minimize_args,
     }
+    candidate_check_coordinator = None
 
     try:
         if bug_file_name[-2:] != ".v":
@@ -4817,6 +4850,10 @@ def main():
 
         env["inlined_requires"] = set()
 
+        evaluator = CoqcEvaluator(log=env["log"], verbose_base=2)
+        candidate_check_coordinator = CandidateCheckCoordinator(evaluator)
+        env["candidate_check_coordinator"] = candidate_check_coordinator
+
         add_admit_tactic_wrapper = make_add_admit_tactic_wrapper(**env)
 
         # if env["minimize_before_inlining"] and not env["inline_one_at_a_time"]:
@@ -4985,12 +5022,46 @@ def main():
             env["log"](traceback.format_exc(), level=LOG_ALWAYS)
         raise
     finally:
+        active_exception = sys.exc_info()[0] is not None
+        cleanup_errors = []
+
+        def run_cleanup_step(description, action):
+            try:
+                action()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+                try:
+                    env["log"](
+                        "Non-fatal error during %s:\n%s"
+                        % (description, traceback.format_exc()),
+                        level=LOG_ALWAYS,
+                    )
+                except BaseException:
+                    pass
+
+        if candidate_check_coordinator is not None:
+            run_cleanup_step(
+                "candidate evaluator cleanup", candidate_check_coordinator.close
+            )
+
         if env.get("remove_temp_file"):
-            clean_v_file(env["temp_file_name"])
-            if os.path.exists(env["temp_file_log_name"]):
-                os.remove(env["temp_file_log_name"])
+            run_cleanup_step(
+                "temporary Coq source cleanup",
+                lambda: clean_v_file(env["temp_file_name"]),
+            )
+            run_cleanup_step(
+                "temporary log cleanup",
+                lambda: (
+                    os.remove(env["temp_file_log_name"])
+                    if os.path.exists(env["temp_file_log_name"])
+                    else None
+                ),
+            )
             all_matching_files = {}
-            for base_temp_file in (env["temp_file_name"], env["temp_file_log_name"]):
+            for base_temp_file in (
+                env["temp_file_name"],
+                env["temp_file_log_name"],
+            ):
                 temp_dir = os.path.dirname(base_temp_file)
                 temp_name = os.path.basename(base_temp_file)
                 if "." in temp_name:
@@ -4998,12 +5069,34 @@ def main():
                     pattern = os.path.join(temp_dir, base_name + "*" + ext)
                 else:
                     pattern = os.path.join(temp_dir, temp_name + "*")
-                all_matching_files[base_temp_file] = glob.glob(pattern)
+                try:
+                    all_matching_files[base_temp_file] = glob.glob(pattern)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+                    all_matching_files[base_temp_file] = []
+                    try:
+                        env["log"](
+                            "Non-fatal error while discovering temporary files:\n%s"
+                            % traceback.format_exc(),
+                            level=LOG_ALWAYS,
+                        )
+                    except BaseException:
+                        pass
             for v_file in all_matching_files[env["temp_file_name"]]:
-                clean_v_file(v_file)
+                run_cleanup_step(
+                    "generated temporary Coq source cleanup",
+                    lambda v_file=v_file: clean_v_file(v_file),
+                )
             for log_file in all_matching_files[env["temp_file_log_name"]]:
-                if os.path.exists(log_file):
-                    os.remove(log_file)
+                run_cleanup_step(
+                    "generated temporary log cleanup",
+                    lambda log_file=log_file: (
+                        os.remove(log_file) if os.path.exists(log_file) else None
+                    ),
+                )
+
+        if cleanup_errors and not active_exception:
+            raise cleanup_errors[0]
 
 
 if __name__ == "__main__":
