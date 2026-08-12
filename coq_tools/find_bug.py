@@ -1509,6 +1509,58 @@ def _candidate_from_source(source, coordinator):
     return CandidateChange.from_sources(coordinator.accepted_source, source)
 
 
+def _candidate_from_definition_change(old_definitions, new_definitions, coordinator):
+    """Describe a definition-list change at exact statement boundaries."""
+    old_statements = tuple(item["statement"] for item in old_definitions)
+    new_statements = tuple(item["statement"] for item in new_definitions)
+    old_source = join_definitions(old_definitions)
+    new_source = join_definitions(new_definitions)
+    if old_source != coordinator.accepted_source:
+        return _candidate_from_source(new_source, coordinator)
+    if old_source == new_source:
+        return CandidateChange.from_sources(old_source, new_source)
+
+    prefix = 0
+    prefix_limit = min(len(old_statements), len(new_statements))
+    while (
+        prefix < prefix_limit
+        and old_statements[prefix] == new_statements[prefix]
+    ):
+        prefix += 1
+    suffix = 0
+    suffix_limit = min(
+        len(old_statements) - prefix, len(new_statements) - prefix
+    )
+    while (
+        suffix < suffix_limit
+        and old_statements[len(old_statements) - suffix - 1]
+        == new_statements[len(new_statements) - suffix - 1]
+    ):
+        suffix += 1
+
+    prefix_source = join_definitions(old_definitions[:prefix])
+    suffix_source = (
+        join_definitions(old_definitions[len(old_definitions) - suffix :])
+        if suffix
+        else ""
+    )
+    start = len(prefix_source)
+    suffix_start = len(old_source) - len(suffix_source)
+    # When both sides are retained, leave the separator immediately before
+    # the suffix in place.  The replacement then starts at the separator after
+    # the prefix, yielding an exact whole-definition deletion where possible.
+    end = (
+        suffix_start - 1
+        if prefix and suffix
+        else suffix_start
+    )
+    replacement_end = len(new_source) - len(suffix_source)
+    if prefix and suffix:
+        replacement_end -= 1
+    replacement = new_source[start:replacement_end]
+    return CandidateChange.splice(old_source, start, end, replacement)
+
+
 def check_candidate_and_write_to_file(
     candidate,
     output_file_name,
@@ -1861,6 +1913,7 @@ def try_transform_each(
         )
     while i >= 0:
         old_definition = definitions[i]
+        base_definitions = definitions
         new_definition, new_rest_definitions = transformer(
             old_definition, definitions[i + 1 :]
         )
@@ -1938,8 +1991,9 @@ def try_transform_each(
                     f"Skipping (at position {i}) based on cached failure", level=3
                 )
             elif check_candidate_and_write_to_file(
-                _candidate_from_source(
-                    join_definitions(try_definitions),
+                _candidate_from_definition_change(
+                    base_definitions,
+                    try_definitions,
                     kwargs["candidate_check_coordinator"],
                 ),
                 output_file_name,
@@ -2052,8 +2106,10 @@ def try_transform_reversed(
                 definitions = definitions[:i] + new_rest_definitions
 
     if check_candidate_and_write_to_file(
-        _candidate_from_source(
-            join_definitions(definitions), kwargs["candidate_check_coordinator"]
+        _candidate_from_definition_change(
+            original_definitions,
+            definitions,
+            kwargs["candidate_check_coordinator"],
         ),
         output_file_name,
         success_message=kwargs["noun_description"] + " successful.",
@@ -2916,8 +2972,10 @@ def try_remove_duplicate_requires(definitions, output_file_name, **kwargs):
     new_definitions = list(yield_definitions())
 
     if check_candidate_and_write_to_file(
-        _candidate_from_source(
-            join_definitions(new_definitions), kwargs["candidate_check_coordinator"]
+        _candidate_from_definition_change(
+            definitions,
+            new_definitions,
+            kwargs["candidate_check_coordinator"],
         ),
         output_file_name,
         success_message="Duplicate Require removal successful.",
@@ -3117,8 +3175,10 @@ def try_lift_requires_and_maybe_custom_entry_declarations_and_maybe_insert_optio
     temp_log_file_name = f"{temp_log_file_base}.{suffix}{temp_log_ext}.orig"
 
     if (all_custom_entries or inserted_new_options) and check_candidate_and_write_to_file(
-        _candidate_from_source(
-            join_definitions(new_definitions), kwargs["candidate_check_coordinator"]
+        _candidate_from_definition_change(
+            definitions,
+            new_definitions,
+            kwargs["candidate_check_coordinator"],
         ),
         output_file_name,
         success_message=f"Require{custom_entry_decl_singular} lifting{inserted_new_options_decl} successful.",

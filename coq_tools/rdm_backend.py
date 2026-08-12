@@ -126,7 +126,7 @@ RdmObservation = namedtuple(
     (
         "status output diagnostics runtime completion processed_items "
         "candidate_items replay_item reused_items split_runtime execution_runtime "
-        "edit_strategy replaced_items cursor generation notifications"
+        "edit_strategy edit_kind replaced_items cursor generation notifications"
     ),
 )
 RdmSessionTrial = namedtuple(
@@ -1084,6 +1084,20 @@ def plan_item_splice(items, candidate, maximum_start_item=None):
         + inserted
         + candidate.base_source[edit_end:end_offset]
     )
+    # Sentence splitting is context-sensitive: after a processed command the
+    # manager requires inserted text to start with blanks.  Pull an immediately
+    # preceding blanks item into the bounded splice rather than falling back to
+    # replacing the complete suffix.
+    if (
+        replacement
+        and not replacement[0].isspace()
+        and start_item > 0
+        and items[start_item - 1].kind == "blanks"
+    ):
+        start_item -= 1
+        leading = items[start_item].text
+        start_offset -= len(leading)
+        replacement = leading + replacement
     reconstructed = (
         candidate.base_source[:start_offset]
         + replacement
@@ -1273,6 +1287,7 @@ class RdmSession(object):
         replay_item,
         split_runtime,
         edit_strategy="load",
+        edit_kind=None,
         replaced_items=None,
     ):
         before_prefix = self.client.doc_prefix(cursor)
@@ -1332,6 +1347,7 @@ class RdmSession(object):
             split_runtime,
             execution_runtime,
             edit_strategy,
+            edit_kind,
             replaced_items,
             cursor,
             self.generation,
@@ -1351,6 +1367,11 @@ class RdmSession(object):
         if candidate.base_source != self.accepted_source:
             raise RdmUnsupported("Candidate base does not match accepted document")
         source = candidate.source
+        edit_kind = (
+            candidate.edits[0].kind
+            if len(candidate.edits) == 1
+            else ("none" if not candidate.edits else "multiple")
+        )
         self.client.set_deadline(time.monotonic() + self._request_timeout)
         cursor = None
         try:
@@ -1378,6 +1399,22 @@ class RdmSession(object):
                 replacement = plan.replacement
                 replace_count = plan.end_item - plan.start_item
                 strategy = plan.strategy
+                # The manager's incremental splitter requires leading blanks
+                # after a command.  Some legacy minimized sources place the
+                # next command directly after a period.  Such a splice cannot
+                # preserve source text while starting at this cursor, so parse
+                # from the beginning rather than disabling the session.
+                if (
+                    strategy != "clear"
+                    and replay_item > 0
+                    and replacement
+                    and not replacement[0].isspace()
+                ):
+                    replay_item = 0
+                    source_offset = 0
+                    replacement = source
+                    replace_count = None
+                    strategy = "full_replace"
             self.client.go_to(cursor, replay_item)
             split_start = time.time()
             try:
@@ -1414,6 +1451,7 @@ class RdmSession(object):
                     split_runtime,
                     0.0,
                     strategy,
+                    edit_kind,
                     replace_count,
                     cursor,
                     self.generation,
@@ -1436,6 +1474,7 @@ class RdmSession(object):
                 replay_item=replay_item,
                 split_runtime=split_runtime,
                 edit_strategy=strategy,
+                edit_kind=edit_kind,
                 replaced_items=replace_count,
             )
             trial = RdmSessionTrial(
@@ -1992,6 +2031,7 @@ class RdmShadowEvaluator(CandidateEvaluator):
             ("split_runtime", observation.split_runtime),
             ("execution_runtime", observation.execution_runtime),
             ("edit_strategy", observation.edit_strategy),
+            ("edit_kind", observation.edit_kind),
             ("replaced_items", observation.replaced_items),
             ("cursor", observation.cursor),
             ("generation", observation.generation),
@@ -2175,6 +2215,7 @@ class RdmShadowEvaluator(CandidateEvaluator):
                 ),
                 "candidate_items": None if document is None else document.candidate_items,
                 "edit_strategy": None if document is None else document.edit_strategy,
+                "edit_kind": None if document is None else document.edit_kind,
                 "replaced_items": None if document is None else document.replaced_items,
                 "diagnostic_agreement": (
                     None
@@ -2641,6 +2682,7 @@ class RdmHybridEvaluator(CandidateEvaluator):
                 ),
                 "candidate_items": None if document is None else document.candidate_items,
                 "edit_strategy": None if document is None else document.edit_strategy,
+                "edit_kind": None if document is None else document.edit_kind,
                 "replaced_items": None if document is None else document.replaced_items,
                 "diagnostic_agreement": (
                     None

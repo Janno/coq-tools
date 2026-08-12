@@ -500,7 +500,11 @@ def summarize_records(records, manifest=None):
     ]
     edit_strategy_counts = {}
     edit_strategy_split_runtime = {}
+    edit_kind_counts = {}
     for item in comparisons:
+        edit_kind = item.get("edit_kind")
+        if edit_kind is not None:
+            edit_kind_counts[edit_kind] = edit_kind_counts.get(edit_kind, 0) + 1
         strategy = item.get("edit_strategy")
         if strategy is None:
             continue
@@ -532,6 +536,7 @@ def summarize_records(records, manifest=None):
         "document_execution_runtime_total": sum(execution_runtimes),
         "edit_strategy_counts": edit_strategy_counts,
         "edit_strategy_split_runtime_total": edit_strategy_split_runtime,
+        "edit_kind_counts": edit_kind_counts,
         "case_runtime_total": sum(case_runtimes),
         "case_runtime_median": _median(case_runtimes),
         "reused_item_observations": len(reused_items),

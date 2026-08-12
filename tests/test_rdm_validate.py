@@ -79,6 +79,7 @@ def test_summary_classifies_direction_and_rollout_gates():
             "document_runtime": 1.0,
             "document_split_runtime": 0.1,
             "edit_strategy": "clear",
+            "edit_kind": "delete",
         },
         {
             "event": "candidate-comparison",
@@ -89,6 +90,7 @@ def test_summary_classifies_direction_and_rollout_gates():
             "document_runtime": 1.5,
             "document_split_runtime": 0.2,
             "edit_strategy": "replace",
+            "edit_kind": "inferred",
         },
         ]
     )
@@ -98,6 +100,7 @@ def test_summary_classifies_direction_and_rollout_gates():
     assert summary["compiler_runtime_total"] == 5.0
     assert summary["document_runtime_total"] == 2.5
     assert summary["edit_strategy_counts"] == {"clear": 1, "replace": 1}
+    assert summary["edit_kind_counts"] == {"delete": 1, "inferred": 1}
     assert summary["edit_strategy_split_runtime_total"] == {
         "clear": 0.1,
         "replace": 0.2,

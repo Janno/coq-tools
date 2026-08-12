@@ -165,6 +165,48 @@ def _candidate(old_source, source):
     return CandidateChange.from_sources(old_source, source)
 
 
+def test_definition_change_emits_exact_statement_range():
+    old = (
+        {"statement": "Definition a := 0.\n"},
+        {"statement": "Definition b := 1.\n"},
+        {"statement": "Check b.\n"},
+    )
+    coordinator = type("Coordinator", (), {})()
+    coordinator.accepted_source = find_bug.join_definitions(old)
+    deleted = find_bug._candidate_from_definition_change(
+        old, old[:1] + old[2:], coordinator
+    )
+    assert deleted.edits[0].kind == "delete"
+    assert deleted.source == find_bug.join_definitions(old[:1] + old[2:])
+    assert deleted.edits[0].start == len(old[0]["statement"])
+    assert deleted.edits[0].end == (
+        len(old[0]["statement"]) + 1 + len(old[1]["statement"])
+    )
+
+    changed = dict(old[1], statement="Definition b := 2.\n")
+    replaced = find_bug._candidate_from_definition_change(
+        old, old[:1] + (changed,) + old[2:], coordinator
+    )
+    assert replaced.edits[0].kind == "replace"
+    assert replaced.source == find_bug.join_definitions(
+        old[:1] + (changed,) + old[2:]
+    )
+    assert replaced.edits[0].replacement == "\nDefinition b := 2.\n"
+    assert replaced.edits[0].start == len(old[0]["statement"])
+
+
+def test_definition_change_falls_back_when_metadata_base_is_stale():
+    coordinator = type("Coordinator", (), {})()
+    coordinator.accepted_source = "prefix accepted suffix"
+    candidate = find_bug._candidate_from_definition_change(
+        ({"statement": "stale"},),
+        ({"statement": "prefix changed suffix"},),
+        coordinator,
+    )
+    assert candidate.base_source == coordinator.accepted_source
+    assert candidate.edits[0].kind == "inferred"
+
+
 def make_env(tmp_path, observations, passing=False, events=None):
     evaluator = FakeEvaluator(observations, events=events)
     coordinator = CandidateCheckCoordinator(evaluator, "old")

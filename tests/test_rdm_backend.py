@@ -457,8 +457,8 @@ def test_item_splice_plan_expands_partial_command_and_preserves_tail():
     )
     plan = rdm_backend.plan_item_splice(items, candidate)
     assert plan.strategy == "replace"
-    assert (plan.start_item, plan.end_item) == (2, 3)
-    assert plan.replacement == "Definition b := 2."
+    assert (plan.start_item, plan.end_item) == (1, 3)
+    assert plan.replacement == "\nDefinition b := 2."
     assert "Check b." not in plan.replacement
 
 
@@ -478,9 +478,9 @@ def test_item_splice_plan_clamps_edits_after_canonical_error():
     plan = rdm_backend.plan_item_splice(
         items, candidate, maximum_start_item=2
     )
-    assert plan.start_item == 2
+    assert plan.start_item == 1
     assert plan.end_item == 5
-    assert plan.replacement == "Check missing.\nCheck I."
+    assert plan.replacement == "\nCheck missing.\nCheck I."
 
 
 def test_unicode_diagnostic_offsets_are_derived_from_candidate_bytes():
@@ -514,6 +514,7 @@ def _document_observation(status, output):
         0.05,
         0.15,
         "replace",
+        "inferred",
         1,
         9,
         1,
@@ -781,6 +782,7 @@ def test_hybrid_comparison_jsonl_retains_route_context_and_metrics(tmp_path):
     assert record["source_sha256"]
     assert record["document_split_runtime"] == 0.05
     assert record["edit_strategy"] == "replace"
+    assert record["edit_kind"] == "inferred"
     assert record["replaced_items"] == 1
     hybrid.finish(trial, False)
 
