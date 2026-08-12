@@ -150,6 +150,13 @@ HybridTrialToken = namedtuple(
         "document_observation document_verdict compiler_verdict reason audited"
     ),
 )
+DocumentOnlyTrialToken = namedtuple(
+    "DocumentOnlyTrialToken",
+    (
+        "source context role policy_identity document_trial "
+        "document_observation document_verdict"
+    ),
+)
 
 REQUIRED_METHODS = frozenset(
     (
@@ -1948,6 +1955,201 @@ class RdmEvaluator(object):
             return
         self.pool.close()
         self._closed = True
+
+
+class RdmOnlyEvaluator(CandidateEvaluator):
+    """Use the document manager as the sole candidate decision authority.
+
+    This deliberately unsafe experimental backend never confirms a candidate
+    verdict with ``coqc`` and never falls back to it.  Unsupported contexts and
+    document infrastructure failures therefore abort evaluation instead of
+    silently changing authority.
+    """
+
+    def __init__(
+        self,
+        context_evaluator,
+        primary_manager,
+        accepted_source,
+        target_policy,
+        passing_manager=None,
+        restart_every=DEFAULT_HYBRID_RESTART_EVERY,
+        request_timeout=DEFAULT_REQUEST_TIMEOUT,
+        cwd=None,
+        environment=None,
+        client_factory=None,
+        log=None,
+        require_trusted=True,
+    ):
+        for name in ("materialize_context", "reset_calibration", "close"):
+            if not hasattr(context_evaluator, name):
+                raise TypeError("context evaluator lacks %s" % name)
+        self.context_evaluator = context_evaluator
+        self.target_policy = target_policy
+        self._log = log or (lambda *args, **kwargs: None)
+        self._jsonl_path = os.environ.get("COQ_TOOLS_RDM_JSONL")
+        self.document_evaluator = RdmEvaluator(
+            primary_manager,
+            accepted_source,
+            target_policy,
+            passing_manager=passing_manager,
+            restart_every=restart_every,
+            cwd=cwd,
+            environment=environment,
+            client_factory=client_factory,
+            log=self._log,
+            request_timeout=request_timeout,
+            require_trusted=require_trusted,
+        )
+        self._closed = False
+
+    @property
+    def identity(self):
+        return (
+            "rdm-only-evaluator",
+            1,
+            self.context_evaluator.identity,
+            self.document_evaluator.identity,
+            self.target_policy.identity,
+        )
+
+    @property
+    def requires_materialization_for_accept(self):
+        return True
+
+    @property
+    def invalidates_cache_after_accept(self):
+        return True
+
+    def materialize_context(self, spec):
+        if self._closed:
+            raise CandidateLifecycleError("Document-only evaluator is closed")
+        return self.context_evaluator.materialize_context(spec)
+
+    @staticmethod
+    def _predicate(policy, role, evaluation):
+        if role == "passing":
+            return policy.passing_succeeds(evaluation)
+        return policy.primary_preserves(evaluation)
+
+    def begin(self, context, candidate, target_policy=None):
+        if self._closed:
+            raise CandidateLifecycleError("Document-only evaluator is closed")
+        if not isinstance(candidate, CandidateChange):
+            raise TypeError("Document-only evaluator requires a CandidateChange")
+        policy = target_policy or self.target_policy
+        if policy.identity != self.target_policy.identity:
+            raise RdmUnsupported("target-policy-mismatch")
+        reason = self.document_evaluator.unsupported_reason(context)
+        if reason is not None:
+            raise RdmUnsupported(
+                "rdm-only cannot evaluate this context: %s" % reason
+            )
+        document_trial = self.document_evaluator.begin(context, candidate)
+        observation = document_trial.observation
+        evaluation = _observation_as_evaluation(observation)
+        verdict = self._predicate(policy, context.role, evaluation)
+        token = DocumentOnlyTrialToken(
+            candidate.source,
+            context,
+            context.role,
+            policy.identity,
+            document_trial,
+            observation,
+            verdict,
+        )
+        return EvaluationTrial(
+            evaluation,
+            token,
+            bool(document_trial.promotable and verdict),
+            False,
+        )
+
+    def acceptance_authorized(self, trial, target_policy, role):
+        token = trial.token
+        return bool(
+            isinstance(token, DocumentOnlyTrialToken)
+            and token.document_trial is not None
+            and token.role == role
+            and token.policy_identity == target_policy.identity
+            and token.document_verdict
+        )
+
+    def finish(self, trial, accepted):
+        token = trial.token
+        if not isinstance(token, DocumentOnlyTrialToken):
+            raise CandidateLifecycleError("Invalid document-only trial token")
+        if accepted and not token.document_verdict:
+            try:
+                self.document_evaluator.finish(token.document_trial, False)
+            finally:
+                raise CandidateLifecycleError(
+                    "Document-only acceptance lacks document authorization"
+                )
+        self.document_evaluator.finish(token.document_trial, bool(accepted))
+
+    def record_target_decision(self, trial, target_policy, role):
+        token = trial.token
+        if not isinstance(token, DocumentOnlyTrialToken):
+            return
+        document = token.document_observation
+        record = {
+            "schema": 1,
+            "role": role,
+            "document_status": document.status,
+            "document_verdict": token.document_verdict,
+        }
+        self._log(
+            "rdm-only: %s"
+            % json.dumps(record, sort_keys=True, separators=(",", ":")),
+            level=1,
+        )
+        pool = getattr(self.document_evaluator, "pool", None)
+        artifact = dict(record)
+        artifact.update(
+            {
+                "event": "candidate-comparison",
+                "mode": "rdm-only",
+                "source_sha256": _sha256_text(token.source),
+                "source_bytes": len(token.source.encode("utf-8")),
+                "context": _context_record(token.context),
+                "backend_identity": self.document_evaluator.identity,
+                "document_runtime": document.runtime,
+                "document_split_runtime": document.split_runtime,
+                "document_execution_runtime": document.execution_runtime,
+                "reused_items": document.reused_items,
+                "commands_replayed": document.processed_items,
+                "candidate_items": document.candidate_items,
+                "edit_strategy": document.edit_strategy,
+                "edit_kind": document.edit_kind,
+                "replaced_items": document.replaced_items,
+                "restart_count": getattr(pool, "restart_count", None),
+                "live_session_count": getattr(pool, "session_count", None),
+                "live_cursor_count": getattr(pool, "cursor_count", None),
+            }
+        )
+        _append_jsonl(self._jsonl_path, artifact)
+
+    def reset_calibration(self, context=None):
+        self.context_evaluator.reset_calibration(context)
+        self.document_evaluator.reset()
+
+    def close(self):
+        if self._closed:
+            return
+        first_error = None
+        try:
+            self.document_evaluator.close()
+        except BaseException as exc:
+            first_error = exc
+        try:
+            self.context_evaluator.close()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        self._closed = True
+        if first_error is not None:
+            raise first_error
 
 
 class RdmShadowEvaluator(CandidateEvaluator):

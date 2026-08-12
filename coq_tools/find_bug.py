@@ -30,6 +30,7 @@ from .rdm_backend import (
     DEFAULT_HYBRID_RESTART_EVERY,
     DEFAULT_REQUEST_TIMEOUT,
     RdmHybridEvaluator,
+    RdmOnlyEvaluator,
     RdmShadowEvaluator,
 )
 from .coq_running_support import (
@@ -150,18 +151,20 @@ parser.add_argument(
 )
 parser.add_argument(
     "--backend",
-    choices=("coqc", "rdm-shadow", "rdm-hybrid"),
+    choices=("coqc", "rdm-shadow", "rdm-hybrid", "rdm-only"),
     default="coqc",
     help=(
         "Candidate evaluation backend. rdm-shadow observes while coqc "
         "decides every candidate; experimental rdm-hybrid may reject "
-        "candidates early but coqc confirms every accepted edit and final output."
+        "candidates early but coqc confirms every accepted edit and final output; "
+        "unsafe experimental rdm-only gives the document manager sole "
+        "candidate authority without compiler confirmation or fallback."
     ),
 )
 parser.add_argument(
     "--rdm",
     default="rocq-doc-manager",
-    help="Path to the rocq-doc-manager executable used in shadow mode.",
+    help="Path to the rocq-doc-manager executable used by rocq-doc-manager backends.",
 )
 parser.add_argument(
     "--passing-rdm",
@@ -178,8 +181,9 @@ parser.add_argument(
     metavar="N",
     help=(
         "Restart each document session after N candidate attempts. By default "
-        "shadow disables periodic restart and hybrid restarts every %d attempts; "
-        "0 disables it explicitly." % DEFAULT_HYBRID_RESTART_EVERY
+        "shadow disables periodic restart and decision-capable rocq-doc-manager backends "
+        "restart every %d attempts; 0 disables it explicitly."
+        % DEFAULT_HYBRID_RESTART_EVERY
     ),
 )
 parser.add_argument(
@@ -1491,8 +1495,10 @@ def classify_candidate(
     )
     try:
         if verdict.result_type == CHANGE_SUCCESS:
-            kwargs["header_dict"]["recent_runtime"] = verdict.runtime
-            kwargs["header_dict"]["recent_peak_rss_kb"] = verdict.peak_rss_kb
+            if verdict.runtime is not None:
+                kwargs["header_dict"]["recent_runtime"] = verdict.runtime
+            if verdict.peak_rss_kb is not None:
+                kwargs["header_dict"]["recent_peak_rss_kb"] = verdict.peak_rss_kb
         serialized_contents = prepend_header(new_contents, **kwargs)
     except BaseException:
         _discard_candidate_preserving_active_exception(
@@ -4740,7 +4746,7 @@ def main():
         "rdm_restart_every": (
             DEFAULT_HYBRID_RESTART_EVERY
             if args.rdm_restart_every is None
-            and args.backend == "rdm-hybrid"
+            and args.backend in ("rdm-hybrid", "rdm-only")
             else (args.rdm_restart_every or 0)
         ),
         "rdm_request_timeout": args.rdm_request_timeout,
@@ -4822,12 +4828,28 @@ def main():
                 ),
                 level=1,
             )
-            if env["rdm_restart_every"] == 0:
-                env["log"](
-                    "Warning: hybrid periodic restart is explicitly disabled; "
-                    "long-session cursor retention is not bounded.",
-                    level=1,
-                )
+        elif env["backend"] == "rdm-only":
+            env["log"](
+                "WARNING: rdm-only is unsafe and experimental: the document "
+                "manager is the sole candidate authority; coqc does not confirm "
+                "accepted edits or the final output, and manager failures do not "
+                "fall back to coqc. request_timeout=%s restart_every=%s"
+                % (
+                    env["rdm_request_timeout"],
+                    env["rdm_restart_every"],
+                ),
+                level=LOG_ALWAYS,
+                force_stdout=True,
+            )
+        if (
+            env["backend"] in ("rdm-hybrid", "rdm-only")
+            and env["rdm_restart_every"] == 0
+        ):
+            env["log"](
+                "Warning: %s periodic restart is explicitly disabled; "
+                "long-session cursor retention is not bounded." % env["backend"],
+                level=1,
+            )
         if env["mem_limit_method"] == "ulimit" and env["max_mem_rss"] is not None:
             env["log"](
                 "\nWarning: --mem-limit-method=ulimit does not support --max-mem-rss. "
@@ -5152,21 +5174,25 @@ def main():
             )
             env["candidate_check_coordinator"] = candidate_check_coordinator
 
-        if env["backend"] in ("rdm-shadow", "rdm-hybrid"):
+        if env["backend"] in (
+            "rdm-shadow",
+            "rdm-hybrid",
+            "rdm-only",
+        ):
             compiler_evaluator = CoqcEvaluator(log=env["log"], verbose_base=2)
             policy_type = (
                 StrictHybridTargetPolicy
-                if env["backend"] == "rdm-hybrid"
+                if env["backend"] in ("rdm-hybrid", "rdm-only")
                 else LegacyTargetPolicy
             )
             target_policy = policy_type(
                 env["should_succeed"], env.get("error_reg_string")
             )
-            evaluator_type = (
-                RdmHybridEvaluator
-                if env["backend"] == "rdm-hybrid"
-                else RdmShadowEvaluator
-            )
+            evaluator_type = {
+                "rdm-shadow": RdmShadowEvaluator,
+                "rdm-hybrid": RdmHybridEvaluator,
+                "rdm-only": RdmOnlyEvaluator,
+            }[env["backend"]]
             evaluator_kwargs = {}
             if env["backend"] == "rdm-hybrid":
                 evaluator_kwargs["check_rejected_every"] = env[

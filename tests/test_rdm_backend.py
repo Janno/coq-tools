@@ -17,6 +17,7 @@ from coq_tools.candidate_evaluator import (
     EvaluationStatus,
     EvaluationTrial,
     LegacyTargetPolicy,
+    StrictHybridTargetPolicy,
 )
 
 
@@ -598,6 +599,140 @@ class FakeDocumentEvaluator(object):
 
     def close(self):
         self.closed = True
+
+
+def _document_only(context_evaluator, document, logs):
+    evaluator = object.__new__(rdm_backend.RdmOnlyEvaluator)
+    evaluator.context_evaluator = context_evaluator
+    evaluator.document_evaluator = document
+    evaluator.target_policy = StrictHybridTargetPolicy(False, "TARGET")
+    evaluator._log = lambda message, **kwargs: logs.append(message)
+    evaluator._jsonl_path = None
+    evaluator._closed = False
+    return evaluator
+
+
+def test_document_only_positive_is_authoritative_without_compiler_execution():
+    context_evaluator = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.CRASH, "must not run", (), 2)
+    )
+    document = FakeDocumentEvaluator(
+        _document_observation("command_error", "Error:\nTARGET\n")
+    )
+    logs = []
+    evaluator = _document_only(context_evaluator, document, logs)
+    Context = namedtuple("Context", "role")
+    context = Context("primary")
+    policy = StrictHybridTargetPolicy(False, "TARGET")
+
+    trial = evaluator.begin(context, _candidate("candidate"), policy)
+    assert trial.evaluation.status == EvaluationStatus.COMMAND_ERROR
+    assert trial.promotable
+    assert evaluator.acceptance_authorized(trial, policy, "primary")
+    assert context_evaluator.begun == []
+
+    evaluator.record_target_decision(trial, policy, "primary")
+    assert '"document_verdict":true' in logs[-1]
+    evaluator.finish(trial, True)
+    assert document.finished[0][1] is True
+    assert context_evaluator.finished == []
+
+
+def test_document_only_rejection_is_not_authorized_or_promoted():
+    context_evaluator = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)
+    )
+    document = FakeDocumentEvaluator(_document_observation("success", ""))
+    evaluator = _document_only(context_evaluator, document, [])
+    Context = namedtuple("Context", "role")
+    context = Context("primary")
+    policy = StrictHybridTargetPolicy(False, "TARGET")
+
+    trial = evaluator.begin(context, _candidate("candidate"), policy)
+    assert not trial.promotable
+    assert not evaluator.acceptance_authorized(trial, policy, "primary")
+    evaluator.finish(trial, False)
+    assert document.finished[0][1] is False
+    assert context_evaluator.begun == []
+
+
+def test_document_only_unavailable_context_aborts_without_compiler_fallback():
+    context_evaluator = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)
+    )
+    document = FakeDocumentEvaluator(reason="unsupported context")
+    evaluator = _document_only(context_evaluator, document, [])
+    Context = namedtuple("Context", "role")
+
+    with pytest.raises(
+        rdm_backend.RdmUnsupported,
+        match="rdm-only cannot evaluate.*unsupported context",
+    ):
+        evaluator.begin(
+            Context("primary"),
+            _candidate("candidate"),
+            StrictHybridTargetPolicy(False, "TARGET"),
+        )
+    assert not document.begun
+    assert not context_evaluator.begun
+
+
+def test_document_only_transport_failure_does_not_fall_back_to_compiler():
+    context_evaluator = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)
+    )
+    document = FakeDocumentEvaluator(
+        begin_error=rdm_backend.RdmUnavailable("manager exited")
+    )
+    evaluator = _document_only(context_evaluator, document, [])
+    Context = namedtuple("Context", "role")
+
+    with pytest.raises(rdm_backend.RdmUnavailable, match="manager exited"):
+        evaluator.begin(
+            Context("primary"),
+            _candidate("candidate"),
+            StrictHybridTargetPolicy(False, "TARGET"),
+        )
+    assert not context_evaluator.begun
+
+
+def test_document_only_jsonl_records_document_metrics(tmp_path):
+    context_evaluator = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.CRASH, "must not run", (), 2)
+    )
+    document = FakeDocumentEvaluator(
+        _document_observation("command_error", "Error:\nTARGET\n")
+    )
+    evaluator = _document_only(context_evaluator, document, [])
+    path = tmp_path / "document-only.jsonl"
+    evaluator._jsonl_path = str(path)
+    Context = namedtuple("Context", "role")
+    policy = StrictHybridTargetPolicy(False, "TARGET")
+    trial = evaluator.begin(Context("primary"), _candidate("candidate"), policy)
+    evaluator.record_target_decision(trial, policy, "primary")
+
+    record = json.loads(path.read_text())
+    assert record["mode"] == "rdm-only"
+    assert record["document_verdict"] is True
+    assert record["document_split_runtime"] == 0.05
+    assert record["document_execution_runtime"] == 0.15
+    assert record["edit_strategy"] == "replace"
+    assert "compiler_runtime" not in record
+    evaluator.finish(trial, False)
+
+
+def test_document_only_reset_and_close_cover_both_components():
+    context_evaluator = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.SUCCESS, "", (), 0)
+    )
+    document = FakeDocumentEvaluator(_document_observation("success", ""))
+    evaluator = _document_only(context_evaluator, document, [])
+    evaluator.reset_calibration()
+    assert context_evaluator.reset_count == 1
+    assert document.reset_count == 1
+    evaluator.close()
+    assert context_evaluator.closed
+    assert document.closed
 
 
 def _shadow(compiler, document, logs):

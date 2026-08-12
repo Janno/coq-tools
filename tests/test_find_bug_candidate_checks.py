@@ -357,6 +357,16 @@ def test_unchanged_short_circuit_does_not_materialize_or_execute(tmp_path):
     assert evaluator.begin_count == 0
 
 
+def test_cli_exposes_explicit_unsafe_document_only_backend():
+    backend_action = next(
+        action
+        for action in find_bug.parser._actions
+        if action.dest == "backend"
+    )
+    assert "rdm-only" in backend_action.choices
+    assert "sole candidate authority" in backend_action.help
+
+
 def test_header_uses_primary_or_passing_runtime_and_peak(tmp_path):
     primary = observation(ERROR_TARGET, 1, runtime=2.5, peak=25.0)
     passing = observation("ok", 0, runtime=7.5, peak=75.0)
@@ -384,6 +394,22 @@ def test_header_uses_primary_or_passing_runtime_and_peak(tmp_path):
         **env
     )
     assert "runtime 2.5 rss 25.0" in decision.serialized_contents
+    coordinator.discard_candidate(decision.attempt)
+
+
+def test_unknown_document_peak_does_not_break_or_erase_header_metric(tmp_path):
+    primary = observation(ERROR_TARGET, 1, runtime=0.2, peak=None)
+    env, evaluator, coordinator = make_env(tmp_path, [primary])
+    env["dynamic_header"] = (
+        "(* runtime %(recent_runtime)s rss %(recent_peak_rss_kb)s *)"
+    )
+    env["header_dict"]["recent_peak_rss_kb"] = 42.0
+    decision = find_bug.classify_candidate(
+        _candidate("old", "new"),
+        logical_file_name=str(tmp_path / "out.v"),
+        **env
+    )
+    assert "runtime 0.2 rss 42.0" in decision.serialized_contents
     coordinator.discard_candidate(decision.attempt)
 
 
