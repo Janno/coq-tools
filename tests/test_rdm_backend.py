@@ -84,6 +84,10 @@ def _make_fake_server(tmp_path):
 
             send({"jsonrpc": "2.0", "method": "boot-note", "params": [1]})
             send({"jsonrpc": "2.0", "method": "ready_seq"})
+            if scenario == "no-read":
+                # Bound a regressed blocking writer even without pytest-level
+                # process supervision; the correct client kills us first.
+                time.sleep(3)
             request = receive()
 
             if scenario == "hang-request":
@@ -257,6 +261,49 @@ def test_startup_and_request_deadlines_reap_process(tmp_path):
     child = process._process
     process.close()
     assert child.poll() is not None
+
+
+def test_large_request_write_deadline_reaps_process(tmp_path):
+    server = _make_fake_server(tmp_path)
+    process = rdm_backend.JsonRpcProcess(
+        (sys.executable, server, "no-read"), request_timeout=2
+    )
+    child = process._process
+    started = rdm_backend.time.monotonic()
+    with pytest.raises(rdm_backend.JsonRpcDeadlineExceeded) as exc_info:
+        process.request(
+            "replace_suffix",
+            [0, "x" * (2 * 1024 * 1024), None],
+            timeout=0.2,
+        )
+    elapsed = rdm_backend.time.monotonic() - started
+    assert exc_info.value.phase == "request write"
+    assert exc_info.value.method == "replace_suffix"
+    assert elapsed < 2.0
+    assert child.poll() is not None
+    with pytest.raises(rdm_backend.JsonRpcError):
+        process.request("ping", [])
+    process.close()
+
+
+def test_large_request_write_obeys_absolute_transaction_deadline(tmp_path):
+    server = _make_fake_server(tmp_path)
+    process = rdm_backend.JsonRpcProcess(
+        (sys.executable, server, "no-read"), request_timeout=30
+    )
+    try:
+        process.set_deadline(rdm_backend.time.monotonic() + 0.2)
+        started = rdm_backend.time.monotonic()
+        with pytest.raises(rdm_backend.JsonRpcDeadlineExceeded) as exc_info:
+            process.request(
+                "replace_suffix", [0, "x" * (2 * 1024 * 1024), None]
+            )
+        assert rdm_backend.time.monotonic() - started < 2.0
+        assert exc_info.value.phase == "request write"
+        assert exc_info.value.timeout <= 0.2
+        assert process._process.poll() is not None
+    finally:
+        process.close()
 
 
 def test_close_is_idempotent(tmp_path):

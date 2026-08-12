@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import glob
+import hashlib
 import math
 import os
 import os.path
@@ -1793,42 +1794,97 @@ def check_candidate_and_write_to_file(
 
 
 def verify_final_hybrid_checkpoint(coordinator, log):
-    """Freshly verify the latest compiler-confirmed raw checkpoint."""
+    """Freshly verify the exact serialized file delivered by hybrid mode."""
     checkpoint = coordinator.last_checkpoint
     if checkpoint is None:
         raise CandidateEvaluatorError(
             "Hybrid final verification has no accepted checkpoint"
         )
+
+    def read_output_snapshot():
+        try:
+            with open(checkpoint.output_file_name, "rb") as source:
+                output_bytes = source.read()
+                info = os.fstat(source.fileno())
+        except (IOError, OSError) as exc:
+            raise CandidateEvaluatorError(
+                "Unable to read hybrid final output %s: %s"
+                % (checkpoint.output_file_name, exc)
+            )
+        fingerprint = (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_nlink,
+            info.st_size,
+            getattr(info, "st_mtime_ns", info.st_mtime),
+            getattr(info, "st_ctime_ns", info.st_ctime),
+        )
+        return output_bytes, fingerprint
+
+    output_bytes, output_fingerprint = read_output_snapshot()
+    expected_bytes = checkpoint.serialized_contents.replace(
+        "\n", os.linesep
+    ).encode("utf-8")
+    if output_bytes != expected_bytes:
+        raise CandidateEvaluatorError(
+            "Hybrid final output differs from its accepted serialization "
+            "(path=%s, expected_sha256=%s, actual_sha256=%s)"
+            % (
+                checkpoint.output_file_name,
+                hashlib.sha256(expected_bytes).hexdigest(),
+                hashlib.sha256(output_bytes).hexdigest(),
+            )
+        )
+    try:
+        output_source = output_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CandidateEvaluatorError(
+            "Hybrid final output %s is not UTF-8: %s"
+            % (checkpoint.output_file_name, exc)
+        )
+
+    def ensure_output_unchanged():
+        current_bytes, current_fingerprint = read_output_snapshot()
+        if (
+            current_bytes != output_bytes
+            or current_fingerprint != output_fingerprint
+        ):
+            raise CandidateEvaluatorError(
+                "Hybrid final output changed during compiler verification: %s"
+                % checkpoint.output_file_name
+            )
+
     evaluator = CoqcEvaluator(log=log, verbose_base=2)
     trials = []
     try:
-        candidate = CandidateChange.from_sources(
-            checkpoint.raw_source, checkpoint.raw_source
-        )
-        primary = evaluator.begin(
+        primary = evaluator.begin_file(
             checkpoint.primary_context,
-            candidate,
+            checkpoint.output_file_name,
+            output_source,
             checkpoint.target_policy,
         )
         trials.append(primary)
+        ensure_output_unchanged()
         if not checkpoint.target_policy.primary_preserves(primary.evaluation):
             raise CandidateEvaluatorError(
                 "Hybrid final primary compiler verification failed:\n%s"
                 % primary.evaluation.output
             )
         if checkpoint.passing_context is not None:
-            passing = evaluator.begin(
+            passing = evaluator.begin_file(
                 checkpoint.passing_context,
-                candidate,
+                checkpoint.output_file_name,
+                output_source,
                 checkpoint.target_policy,
             )
             trials.append(passing)
+            ensure_output_unchanged()
             if not checkpoint.target_policy.passing_succeeds(passing.evaluation):
                 raise CandidateEvaluatorError(
                     "Hybrid final passing compiler verification failed:\n%s"
                     % passing.evaluation.output
                 )
-        log("rdm-hybrid final compiler verification succeeded", level=1)
     finally:
         active_exception = sys.exc_info()[0] is not None
         for trial in reversed(trials):
@@ -1842,6 +1898,9 @@ def verify_final_hybrid_checkpoint(coordinator, log):
         except BaseException:
             if not active_exception:
                 raise
+
+    ensure_output_unchanged()
+    log("rdm-hybrid final compiler verification succeeded", level=1)
 
 
 # Cache for tracking failed edit suffixes when --faster-skip-repeat-edit-suffixes is enabled
@@ -3570,7 +3629,9 @@ def try_minimize_coqc_args(output_file_name, **env):
         "\nI will now attempt to minimize the command-line arguments..."
     )
     coqc_help = get_coqc_help(env["coqc"], **env)
-    contents = read_from_file(output_file_name)
+    # Argument changes do not change the accepted raw program.  In particular,
+    # do not feed the serialized output header back into candidate evaluation.
+    contents = env["candidate_check_coordinator"].accepted_source
 
     # Group args into logical units (e.g., ("-Q", "dir", "lib") as one group)
     grouped_args = group_coq_args(env["coqc_args"], coqc_help)
@@ -3668,10 +3729,8 @@ def try_minimize_coqc_args(output_file_name, **env):
     new_args = tuple(arg for g in grouped_args for arg in g)
     if new_args != env["coqc_args"]:
         env["coqc_args"] = new_args
-        # Rewrite the file with the new header
-        env["header_dict"] = get_header_dict(contents, **env)
-        new_file_contents = prepend_header(contents, **env)
-        write_to_file(output_file_name, new_file_contents)
+        # Each successful removal already serialized, wrote, and checkpointed
+        # the output using the reduced argument tuple.
         env["log"]("Updated output file with minimized arguments")
     else:
         env["log"]("No arguments could be removed")

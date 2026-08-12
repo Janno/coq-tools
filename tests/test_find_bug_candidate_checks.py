@@ -13,6 +13,7 @@ from coq_tools.candidate_evaluator import (
     CandidateCheckCoordinator,
     CandidateCheckpoint,
     CandidateEvaluator,
+    CandidateEvaluatorError,
     CandidateFinalizationError,
     Evaluation,
     EvaluationContext,
@@ -117,16 +118,23 @@ class FakeEvaluator(CandidateEvaluator):
         self.events.append("close")
 
 
-def test_final_hybrid_verification_is_fresh_and_checks_both_roles(monkeypatch):
+def test_final_hybrid_verification_is_fresh_and_checks_exact_disk_source(
+    tmp_path, monkeypatch
+):
     events = []
     policy = find_bug.StrictHybridTargetPolicy(False, "target")
     primary = object()
     passing = object()
+    output_path = tmp_path / "out.v"
+    serialized = "Timeout 7 Check Set.\nFail target.\n"
+    output_path.write_bytes(
+        serialized.replace("\n", os.linesep).encode("utf-8")
+    )
     coordinator = type("Coordinator", (), {})()
     coordinator.last_checkpoint = CandidateCheckpoint(
-        "raw",
-        "serialized",
-        "out.v",
+        "raw source without the delivered header",
+        serialized,
+        str(output_path),
         primary,
         passing,
         policy,
@@ -136,9 +144,13 @@ def test_final_hybrid_verification_is_fresh_and_checks_both_roles(monkeypatch):
         def __init__(self, log, verbose_base=2):
             events.append("construct")
 
-        def begin(self, context, candidate, target_policy=None):
-            assert isinstance(candidate, CandidateChange)
-            events.append(("begin", context, candidate, target_policy))
+        def begin_file(
+            self, context, source_file_name, source, target_policy=None
+        ):
+            assert source_file_name == str(output_path)
+            assert source.encode("utf-8") == output_path.read_bytes()
+            assert source != coordinator.last_checkpoint.raw_source
+            events.append(("begin", context, source_file_name, source, target_policy))
             if context is primary:
                 value = Evaluation(
                     EvaluationStatus.COMMAND_ERROR, ERROR_TARGET, (), 1
@@ -157,8 +169,133 @@ def test_final_hybrid_verification_is_fresh_and_checks_both_roles(monkeypatch):
     find_bug.verify_final_hybrid_checkpoint(
         coordinator, lambda *args, **kwargs: None
     )
-    assert [event[1] for event in events if isinstance(event, tuple) and event[0] == "begin"] == [primary, passing]
+    assert [
+        event[1]
+        for event in events
+        if isinstance(event, tuple) and event[0] == "begin"
+    ] == [primary, passing]
     assert events[-1] == "close"
+
+
+def test_final_hybrid_verification_rejects_disk_checkpoint_mismatch(
+    tmp_path, monkeypatch
+):
+    output_path = tmp_path / "out.v"
+    output_path.write_text("different")
+    coordinator = type("Coordinator", (), {})()
+    coordinator.last_checkpoint = CandidateCheckpoint(
+        "raw",
+        "accepted serialization",
+        str(output_path),
+        object(),
+        None,
+        find_bug.StrictHybridTargetPolicy(False, "target"),
+    )
+
+    def unexpected_verifier(*args, **kwargs):
+        raise AssertionError("compiler must not run for a mismatched artifact")
+
+    monkeypatch.setattr(find_bug, "CoqcEvaluator", unexpected_verifier)
+    with pytest.raises(CandidateEvaluatorError, match="differs"):
+        find_bug.verify_final_hybrid_checkpoint(
+            coordinator, lambda *args, **kwargs: None
+        )
+
+
+def test_final_hybrid_verification_checks_semantic_serialized_header(
+    tmp_path, monkeypatch
+):
+    output_path = tmp_path / "out.v"
+    serialized = "Timeout 0 Check Set.\nFail target.\n"
+    output_path.write_bytes(
+        serialized.replace("\n", os.linesep).encode("utf-8")
+    )
+    policy = find_bug.StrictHybridTargetPolicy(False, "target")
+    coordinator = type("Coordinator", (), {})()
+    coordinator.last_checkpoint = CandidateCheckpoint(
+        "Fail target.\n",
+        serialized,
+        str(output_path),
+        object(),
+        None,
+        policy,
+    )
+
+    class Verifier(object):
+        def __init__(self, log, verbose_base=2):
+            pass
+
+        def begin_file(
+            self, context, source_file_name, source, target_policy=None
+        ):
+            assert source_file_name == str(output_path)
+            assert source.startswith("Timeout 0")
+            return EvaluationTrial(
+                Evaluation(EvaluationStatus.COMMAND_ERROR, ERROR_OTHER, (), 1),
+                None,
+                False,
+                False,
+            )
+
+        def finish(self, trial, accepted):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(find_bug, "CoqcEvaluator", Verifier)
+    with pytest.raises(CandidateEvaluatorError, match="primary compiler"):
+        find_bug.verify_final_hybrid_checkpoint(
+            coordinator, lambda *args, **kwargs: None
+        )
+
+
+def test_final_hybrid_verification_detects_restored_in_place_mutation(
+    tmp_path, monkeypatch
+):
+    output_path = tmp_path / "out.v"
+    serialized = "Fail target.\n"
+    expected_bytes = serialized.replace("\n", os.linesep).encode("utf-8")
+    output_path.write_bytes(expected_bytes)
+    policy = find_bug.StrictHybridTargetPolicy(False, "target")
+    coordinator = type("Coordinator", (), {})()
+    coordinator.last_checkpoint = CandidateCheckpoint(
+        "Fail target.\n",
+        serialized,
+        str(output_path),
+        object(),
+        None,
+        policy,
+    )
+
+    class Verifier(object):
+        def __init__(self, log, verbose_base=2):
+            pass
+
+        def begin_file(
+            self, context, source_file_name, source, target_policy=None
+        ):
+            output_path.write_bytes(b"temporary replacement")
+            output_path.write_bytes(expected_bytes)
+            os.utime(str(output_path), (1, 1))
+            return EvaluationTrial(
+                Evaluation(EvaluationStatus.COMMAND_ERROR, ERROR_TARGET, (), 1),
+                None,
+                False,
+                False,
+            )
+
+        def finish(self, trial, accepted):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(find_bug, "CoqcEvaluator", Verifier)
+    with pytest.raises(CandidateEvaluatorError, match="changed during"):
+        find_bug.verify_final_hybrid_checkpoint(
+            coordinator, lambda *args, **kwargs: None
+        )
 
 
 def _candidate(old_source, source):
@@ -320,6 +457,49 @@ def test_candidate_decision_matrix(
     )
     assert decision.outputs == expected_outputs
     coordinator.discard_candidate(decision.attempt)
+
+
+def test_argument_minimization_reuses_raw_source_without_direct_rewrite(
+    tmp_path, monkeypatch
+):
+    coordinator = type("Coordinator", (), {})()
+    coordinator.accepted_source = "Fail target.\n"
+    observed = []
+
+    monkeypatch.setattr(find_bug, "get_coqc_help", lambda *args, **kwargs: "")
+    monkeypatch.setattr(
+        find_bug,
+        "group_coq_args",
+        lambda arguments, help_text: [tuple(arguments)] if arguments else [],
+    )
+
+    def accept_reduced_arguments(candidate, output_file_name, **kwargs):
+        observed.append((candidate, kwargs["coqc_args"]))
+        return True
+
+    monkeypatch.setattr(
+        find_bug, "check_candidate_and_write_to_file", accept_reduced_arguments
+    )
+    monkeypatch.setattr(
+        find_bug,
+        "write_to_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("argument minimization must not rewrite directly")
+        ),
+    )
+    new_args, raw_source = find_bug.try_minimize_coqc_args(
+        str(tmp_path / "not-created.v"),
+        candidate_check_coordinator=coordinator,
+        coqc=("coqc",),
+        coqc_args=("-w", "all"),
+        log=lambda *args, **kwargs: None,
+    )
+    assert new_args == ()
+    assert raw_source == coordinator.accepted_source
+    assert len(observed) == 1
+    assert observed[0][0].base_source == coordinator.accepted_source
+    assert observed[0][0].source == coordinator.accepted_source
+    assert observed[0][1] == ()
 
 
 def test_context_specs_follow_each_request_and_preserve_explicit_memory_key(

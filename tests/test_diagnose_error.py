@@ -187,6 +187,35 @@ def test_cache_bypass_runs_fresh_does_not_store_and_forwards_environment(
     assert all(not os.path.exists(name) for name in source_names)
 
 
+def test_existing_source_path_is_compiled_in_place_without_cleanup(
+    isolated_executor, monkeypatch, tmp_path
+):
+    source = tmp_path / "Delivered.v"
+    source.write_text("Check nat.\n")
+    commands = []
+
+    def fake_process(log, command, **kwargs):
+        commands.append(tuple(command))
+        assert command[-2] == str(source)
+        assert source.read_text() == "Check nat.\n"
+        return (("ok", ""), 0, 0)
+
+    monkeypatch.setattr(
+        diagnose_error, "memory_robust_timeout_Popen_communicate", fake_process
+    )
+    diagnose_error.get_coq_output(
+        ("coqc",),
+        (),
+        "Check nat.\n",
+        None,
+        source_file_name=str(source),
+        use_cache=False,
+        **_executor_kwargs(),
+    )
+    assert commands == [("coqc", str(source), "-q")]
+    assert source.exists()
+
+
 def test_structured_checker_metadata_and_staged_multiplier_resolution(
     isolated_executor, monkeypatch
 ):

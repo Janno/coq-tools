@@ -700,6 +700,7 @@ def prepare_cmds_for_coq_output(
     use_cache=True,
     process_environment=None,
     log_cwd=_UNSET,
+    source_file_name=None,
     **kwargs,
 ):
     """Prepare one execution and transfer temporary-source ownership.
@@ -735,6 +736,8 @@ def prepare_cmds_for_coq_output(
 
         return rmtree_onerror
 
+    if source_file_name is not None:
+        source_file_name = os.path.abspath(source_file_name)
     key = (
         coqc_prog,
         tuple(coqc_prog_args),
@@ -743,6 +746,7 @@ def prepare_cmds_for_coq_output(
         timeout_val,
         cwd,
         ocamlpath,
+        source_file_name,
     )
     if process_environment is not None:
         key = key + (
@@ -761,6 +765,15 @@ def prepare_cmds_for_coq_output(
     cleaner = None
     if use_cache and key in COQ_OUTPUT:
         file_name = COQ_OUTPUT[key][0]
+        cleaner = lambda: None
+    elif source_file_name is not None:
+        if kwargs["pass_on_stdin"]:
+            raise ValueError(
+                "An existing source path cannot be verified through stdin"
+            )
+        if not os.path.isfile(source_file_name):
+            raise IOError("Existing Coq source does not exist: %s" % source_file_name)
+        file_name = source_file_name
         cleaner = lambda: None
     else:
         try:
@@ -971,6 +984,7 @@ def _get_coq_output_result(
     should_calibrate_timeout=None,
     memory_plan=None,
     automatic_debug_retry=True,
+    source_file_name=None,
     **kwargs,
 ):
     """Private structured executor used by the compiler candidate adapter."""
@@ -1000,6 +1014,7 @@ def _get_coq_output_result(
             should_calibrate_timeout=should_calibrate_timeout,
             memory_plan=memory_plan,
             automatic_debug_retry=automatic_debug_retry,
+            source_file_name=source_file_name,
             **kwargs,
         )
 
@@ -1028,6 +1043,7 @@ def _get_coq_output_result(
         use_cache=use_cache,
         process_environment=process_environment,
         log_cwd=log_cwd,
+        source_file_name=source_file_name,
         **kwargs,
     )
     key = key + key_extra
@@ -1229,6 +1245,7 @@ def _get_coq_output_result(
             should_calibrate_timeout=should_calibrate_timeout,
             memory_plan=memory_plan,
             automatic_debug_retry=False,
+            source_file_name=source_file_name,
             **kwargs,
         )
         return CoqOutputResult(

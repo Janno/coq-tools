@@ -356,6 +356,30 @@ def test_coqc_adapter_maps_status_precedence_and_preserves_metadata(monkeypatch)
     assert calls[0][1]["memory_plan"] == context.resource_policy.memory_plan
 
 
+def test_coqc_adapter_begin_file_forwards_existing_path(monkeypatch, tmp_path):
+    source = tmp_path / "Delivered.v"
+    source.write_text("Check nat.\n")
+    result = diagnose_error.CoqOutputResult(
+        "ok", ("coqc", str(source)), 0, 1.0, 2.0
+    )
+    calls = []
+
+    def fake_executor(*args, **kwargs):
+        calls.append((args, kwargs))
+        return result
+
+    monkeypatch.setattr(diagnose_error, "_get_coq_output_result", fake_executor)
+    monkeypatch.setattr(diagnose_error, "default_retry_with_debug_when", lambda x: False)
+    evaluator = CoqcEvaluator(lambda *args, **kwargs: None)
+    context = evaluator.materialize_context(_spec())
+    trial = evaluator.begin_file(
+        context, str(source), source.read_text(), LegacyTargetPolicy(True)
+    )
+    assert trial.evaluation.returncode == 0
+    assert calls[0][1]["source_file_name"] == str(source)
+    assert calls[0][0][2] == source.read_text()
+
+
 @pytest.mark.parametrize(
     "requested,expected_retry_deadline",
     ((-1, 12), (0, None), (5, 5), (None, None)),

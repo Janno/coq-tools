@@ -1019,7 +1019,7 @@ class CoqcEvaluator(CandidateEvaluator):
             return EvaluationStatus.SUCCESS
         return EvaluationStatus.CRASH
 
-    def _run(self, context, source):
+    def _run(self, context, source, source_file_name=None):
         policy = context.resource_policy
         result = diagnose_error._get_coq_output_result(
             context.executable,
@@ -1045,15 +1045,14 @@ class CoqcEvaluator(CandidateEvaluator):
             should_calibrate_timeout=policy.timeout_policy.should_calibrate_timeout,
             memory_plan=policy.memory_plan,
             automatic_debug_retry=False,
+            source_file_name=source_file_name,
         )
         return result
 
-    def begin(self, context, candidate, target_policy=None):
-        self._ensure_open()
-        if not isinstance(candidate, CandidateChange):
-            raise TypeError("CoqcEvaluator.begin requires a CandidateChange")
-        source = candidate.source
-        result = self._run(context, source)
+    def _begin_source(
+        self, context, source, target_policy=None, source_file_name=None
+    ):
+        result = self._run(context, source, source_file_name=source_file_name)
         metadata = (("stages", result.stages),)
         final_context = context
         if diagnose_error.default_retry_with_debug_when(result.output):
@@ -1083,7 +1082,9 @@ class CoqcEvaluator(CandidateEvaluator):
                 role=context.role,
             )
             final_context = self.materialize_context(retry_spec)
-            retry_result = self._run(final_context, source)
+            retry_result = self._run(
+                final_context, source, source_file_name=source_file_name
+            )
             metadata = (
                 ("preliminary_stages", result.stages),
                 ("debug_stages", retry_result.stages),
@@ -1101,6 +1102,24 @@ class CoqcEvaluator(CandidateEvaluator):
             metadata,
         )
         return EvaluationTrial(evaluation, None, False, False)
+
+    def begin(self, context, candidate, target_policy=None):
+        self._ensure_open()
+        if not isinstance(candidate, CandidateChange):
+            raise TypeError("CoqcEvaluator.begin requires a CandidateChange")
+        return self._begin_source(context, candidate.source, target_policy)
+
+    def begin_file(self, context, source_file_name, source, target_policy=None):
+        """Evaluate the supplied source through its existing on-disk path."""
+        self._ensure_open()
+        if not isinstance(source_file_name, str) or not isinstance(source, str):
+            raise TypeError("CoqcEvaluator.begin_file requires text path and source")
+        return self._begin_source(
+            context,
+            source,
+            target_policy,
+            source_file_name=os.path.abspath(source_file_name),
+        )
 
     def finish(self, trial, accepted):
         # The compiler adapter has no promotable state.

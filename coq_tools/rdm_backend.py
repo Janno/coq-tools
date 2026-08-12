@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from collections import namedtuple
 
@@ -450,6 +451,7 @@ class JsonRpcProcess(object):
         self._next_id = 0
         self._in_request = False
         self._absolute_deadline = None
+        self._writer_thread = None
         self._usable = True
         self._closed = False
         self.returncode = None
@@ -618,13 +620,120 @@ class JsonRpcProcess(object):
                 stderr_tail=self._stderr_tail(),
             )
 
-    def _send(self, packet):
+    def _write_deadline_error(self, request_timeout, method):
+        return JsonRpcDeadlineExceeded(
+            "request write",
+            request_timeout,
+            method=method,
+            stderr_tail=self._stderr_tail(),
+        )
+
+    def _write_frame_posix(
+        self, frame, deadline, request_timeout, method
+    ):
+        """Write one frame with nonblocking POSIX pipe readiness."""
+        descriptor = self._process.stdin.fileno()
+        get_blocking = getattr(os, "get_blocking", None)
+        set_blocking = getattr(os, "set_blocking", None)
+        if get_blocking is None or set_blocking is None:
+            return self._write_frame_threaded(
+                frame, deadline, request_timeout, method
+            )
+        was_blocking = get_blocking(descriptor)
+        try:
+            set_blocking(descriptor, False)
+            offset = 0
+            view = memoryview(frame)
+            with selectors.DefaultSelector() as selector:
+                selector.register(descriptor, selectors.EVENT_WRITE)
+                while offset < len(frame):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not selector.select(remaining):
+                        raise self._write_deadline_error(
+                            request_timeout, method
+                        )
+                    try:
+                        written = os.write(
+                            descriptor, view[offset : offset + 65536]
+                        )
+                    except BlockingIOError:
+                        continue
+                    if written <= 0:
+                        raise OSError("JSON-RPC pipe accepted no request bytes")
+                    offset += written
+        finally:
+            try:
+                set_blocking(descriptor, was_blocking)
+            except OSError:
+                pass
+
+    def _write_frame_threaded(
+        self, frame, deadline, request_timeout, method
+    ):
+        """Fallback for platforms whose selectors cannot monitor pipes.
+
+        Terminating the child closes the read end and unblocks ordinary
+        anonymous-pipe writes on the platforms supported by this backend.
+        """
+        descriptor = self._process.stdin.fileno()
+        completed = threading.Event()
+        errors = []
+
+        def write_frame():
+            try:
+                offset = 0
+                view = memoryview(frame)
+                while offset < len(frame):
+                    written = os.write(
+                        descriptor, view[offset : offset + 65536]
+                    )
+                    if written <= 0:
+                        raise OSError(
+                            "JSON-RPC pipe accepted no request bytes"
+                        )
+                    offset += written
+            except (IOError, OSError) as exc:
+                errors.append(exc)
+            finally:
+                completed.set()
+
+        writer = threading.Thread(target=write_frame)
+        writer.daemon = True
+        self._writer_thread = writer
+        writer.start()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not completed.wait(remaining):
+            raise self._write_deadline_error(request_timeout, method)
+        writer.join()
+        self._writer_thread = None
+        if errors:
+            raise errors[0]
+
+    def _send(self, packet, deadline, request_timeout, method):
         self._ensure_usable()
         if self._process.stdin is None:
             raise JsonRpcError("JSON-RPC stdin is unavailable")
         try:
-            self._process.stdin.write(encode_json_rpc_frame(packet))
-            self._process.stdin.flush()
+            frame = encode_json_rpc_frame(packet)
+            if deadline - time.monotonic() <= 0:
+                raise self._write_deadline_error(request_timeout, method)
+            if os.name == "posix":
+                self._write_frame_posix(
+                    frame, deadline, request_timeout, method
+                )
+            else:
+                self._write_frame_threaded(
+                    frame, deadline, request_timeout, method
+                )
+        except JsonRpcDeadlineExceeded:
+            self._usable = False
+            self._terminate_process_group()
+            writer = self._writer_thread
+            if writer is not None:
+                writer.join(PROCESS_TERM_GRACE)
+                if not writer.is_alive():
+                    self._writer_thread = None
+            raise
         except (IOError, OSError) as exc:
             self._usable = False
             code = self._poll_after_eof()
@@ -648,9 +757,11 @@ class JsonRpcProcess(object):
         request_timeout = self._request_timeout if timeout is None else float(timeout)
         if request_timeout <= 0:
             raise ValueError("request timeout must be positive")
-        deadline = time.monotonic() + request_timeout
+        request_started = time.monotonic()
+        deadline = request_started + request_timeout
         if self._absolute_deadline is not None:
             deadline = min(deadline, self._absolute_deadline)
+        effective_request_timeout = max(0.0, deadline - request_started)
         self._in_request = True
         try:
             self._send(
@@ -659,7 +770,10 @@ class JsonRpcProcess(object):
                     "id": request_id,
                     "method": method,
                     "params": list(params),
-                }
+                },
+                deadline,
+                effective_request_timeout,
+                method,
             )
             while True:
                 packet = self._receive(deadline, "request", method)
@@ -767,6 +881,15 @@ class JsonRpcProcess(object):
             return
         process = self._process
         first_error = None
+        writer = self._writer_thread
+        if writer is not None and writer.is_alive():
+            try:
+                self._terminate_process_group()
+                writer.join(PROCESS_TERM_GRACE)
+            except BaseException as exc:
+                first_error = exc
+        if writer is not None and not writer.is_alive():
+            self._writer_thread = None
         if process is not None:
             try:
                 if process.stdin is not None:

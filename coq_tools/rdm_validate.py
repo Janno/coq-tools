@@ -1,8 +1,9 @@
 """rocq-doc-manager differential corpus and benchmark runner.
 
 The runner is deliberately standard-library-only and Python 3.6 compatible.
-It executes the version-controlled example manifest, retains JSONL records and
-logs, benchmarks late-suffix candidate evaluation, and evaluates rollout gates.
+It executes the version-controlled example manifest in an isolated disposable
+clone, retains JSONL records and logs outside that clone, benchmarks late-suffix
+candidate evaluation, and evaluates rollout gates.
 """
 from __future__ import print_function
 
@@ -14,6 +15,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import statistics
 import subprocess
 import sys
@@ -38,17 +40,39 @@ REQUIRED_CASE_FIELDS = (
     "expected_outcome",
 )
 COMPARISON_EVENT = "candidate-comparison"
+OUTPUT_MARKER = ".rdm-corpus-output.json"
 
 
 def _json_dump(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+def _open_regular_file(path, flags, mode=0o600):
+    descriptor = os.open(
+        path, flags | getattr(os, "O_NOFOLLOW", 0), mode
+    )
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise RuntimeError("Refusing to write non-regular output %s" % path)
+    return descriptor
+
+
+def _write_all(descriptor, payload):
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise IOError("Unable to write validation output")
+        offset += written
+
+
 def _append_jsonl(path, value):
     payload = (_json_dump(value) + "\n").encode("utf-8")
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    descriptor = _open_regular_file(
+        path, os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    )
     try:
-        os.write(descriptor, payload)
+        _write_all(descriptor, payload)
     finally:
         os.close(descriptor)
 
@@ -97,6 +121,18 @@ def _command_output(command, cwd=None, environment=None, timeout=30):
     return completed.returncode, completed.stdout.decode("utf-8", "replace").strip()
 
 
+def _checked_command(command, cwd=None, environment=None, timeout=300):
+    code, output = _command_output(
+        command, cwd=cwd, environment=environment, timeout=timeout
+    )
+    if code != 0:
+        raise RuntimeError(
+            "Command failed with return code %r: %s\n%s"
+            % (code, " ".join(command), output or "")
+        )
+    return output
+
+
 def _git(repository, arguments):
     code, output = _command_output(["git"] + list(arguments), cwd=repository)
     if code != 0:
@@ -131,6 +167,10 @@ def load_manifest(path, repository=None):
         if missing:
             raise ValueError("Case %d lacks %s" % (index, ", ".join(missing)))
         identifier = case["id"]
+        if not isinstance(identifier, str) or re.match(
+            r"\Aexample-[0-9]{3}(?:-[0-9]+)?\Z", identifier
+        ) is None:
+            raise ValueError("Invalid case id %r" % identifier)
         if identifier in identifiers:
             raise ValueError("Duplicate case id %s" % identifier)
         identifiers.add(identifier)
@@ -242,35 +282,52 @@ def _case_selected(case, requested, pattern):
     return True
 
 
+def _case_tokens(case):
+    identifier = case["id"].split("example-", 1)[-1]
+    return identifier.split("-", 1)[0], identifier.replace("-", "_")
+
+
 def _clean_case(repository, case):
-    number = case["id"].split("example-", 1)[-1]
+    """Reset generated files inside the validator-owned disposable clone."""
+    directory_token, artifact_token = _case_tokens(case)
     paths = [
-        os.path.join("examples", "example_" + number),
-        os.path.join("examples", "example_%s_output.v" % number),
-        os.path.join("examples", "example_%s_log.log" % number),
-        os.path.join("examples", "example_%s_make.log" % number),
-        os.path.join("examples", "example_%s_result.log" % number),
+        os.path.join("examples", "example_" + directory_token),
+        os.path.join("examples", "example_%s_output.v" % artifact_token),
+        os.path.join("examples", "example_%s_log.log" % artifact_token),
+        os.path.join("examples", "example_%s_make.log" % artifact_token),
+        os.path.join("examples", "example_%s_result.log" % artifact_token),
     ]
-    subprocess.run(
-        ["git", "clean", "-fdx", "--"] + paths,
-        cwd=repository,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    _checked_command(["git", "clean", "-fdx", "--"] + paths, cwd=repository)
 
 
 def _untracked_v_files(repository, case):
-    code, output = _command_output(
-        ["git", "ls-files", "--others", "--ignored", "--exclude-standard", "examples"],
-        cwd=repository,
+    outputs = (
+        _checked_command(
+            ["git", "ls-files", "--others", "--exclude-standard", "examples"],
+            cwd=repository,
+        ),
+        _checked_command(
+            [
+                "git",
+                "ls-files",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "examples",
+            ],
+            cwd=repository,
+        ),
     )
-    if code != 0 or not output:
-        return []
-    number = case["id"].split("example-", 1)[-1]
-    markers = ("example_%s" % number, "bug_%s" % number)
+    unused_directory_token, artifact_token = _case_tokens(case)
+    markers = (
+        "example_%s" % artifact_token,
+        "bug_%s" % artifact_token,
+    )
     return sorted(
         path
-        for path in output.splitlines()
+        for path in set(
+            item for output in outputs for item in output.splitlines()
+        )
         if path.endswith(".v") and any(marker in path for marker in markers)
     )
 
@@ -575,86 +632,221 @@ def summarize_records(records, manifest=None):
     }
 
 
+def _repository_has_tracked_changes(repository):
+    environment = dict(os.environ)
+    # Keep even Git's optional index refresh out of the caller checkout.
+    environment["GIT_OPTIONAL_LOCKS"] = "0"
+    return bool(
+        _checked_command(
+            ["git", "status", "--porcelain=v1", "--untracked-files=no"],
+            cwd=repository,
+            environment=environment,
+        )
+    )
+
+
+def _create_isolated_repository(repository, destination):
+    """Clone committed HEAD without sharing writable Git object storage."""
+    top_level = _checked_command(
+        ["git", "rev-parse", "--show-toplevel"], cwd=repository
+    )
+    if not top_level or os.path.realpath(top_level) != os.path.realpath(repository):
+        raise RuntimeError("--repository must name the Git working-tree root")
+    commit = _checked_command(["git", "rev-parse", "HEAD"], cwd=repository)
+    if not commit:
+        raise RuntimeError("Unable to identify repository HEAD")
+    if _repository_has_tracked_changes(repository):
+        raise RuntimeError(
+            "run-corpus requires a clean index and tracked working tree; "
+            "untracked and ignored caller files are allowed and remain untouched"
+        )
+    _checked_command(
+        ["git", "clone", "--no-hardlinks", "--no-checkout", "--", repository, destination]
+    )
+    _checked_command(["git", "checkout", "--detach", commit], cwd=destination)
+    _checked_command(
+        ["git", "submodule", "update", "--init", "--recursive"],
+        cwd=destination,
+    )
+    return destination
+
+
+def _initialize_output_directory(output_directory, resume):
+    marker_path = os.path.join(output_directory, OUTPUT_MARKER)
+    if not resume:
+        if os.path.lexists(output_directory):
+            raise RuntimeError(
+                "run-corpus --output must not already exist without --resume"
+            )
+        os.makedirs(output_directory)
+        descriptor = _open_regular_file(
+            marker_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        )
+        try:
+            _write_all(
+                descriptor,
+                (_json_dump({"schema": 1, "kind": "rdm-corpus-output"}) + "\n").encode(
+                    "utf-8"
+                ),
+            )
+        finally:
+            os.close(descriptor)
+        return
+
+    if os.path.islink(output_directory) or not os.path.isdir(output_directory):
+        raise RuntimeError("--resume requires an owned corpus output directory")
+    if os.path.islink(marker_path) or not os.path.isfile(marker_path):
+        raise RuntimeError("--resume output lacks the corpus ownership marker")
+    with open(marker_path, "r", encoding="utf-8") as source:
+        try:
+            marker = json.load(source)
+        except ValueError as exc:
+            raise RuntimeError("Invalid corpus ownership marker: %s" % exc)
+    if marker != {"schema": 1, "kind": "rdm-corpus-output"}:
+        raise RuntimeError("Unrecognized corpus ownership marker")
+    def walk_error(error):
+        raise RuntimeError(
+            "Unable to inspect resume output %s: %s"
+            % (getattr(error, "filename", output_directory), error)
+        )
+
+    for root, directories, files in os.walk(
+        output_directory, followlinks=False, onerror=walk_error
+    ):
+        for name in directories:
+            path = os.path.join(root, name)
+            if os.path.islink(path) or not os.path.isdir(path):
+                raise RuntimeError(
+                    "Refusing to resume with unsafe output directory %s" % path
+                )
+        for name in files:
+            path = os.path.join(root, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                raise RuntimeError(
+                    "Refusing to resume with symlinked or non-regular output %s"
+                    % path
+                )
+            if os.stat(path).st_nlink != 1:
+                raise RuntimeError(
+                    "Refusing to resume with hard-linked output %s" % path
+                )
+
+
 def run_corpus(arguments):
-    repository = os.path.abspath(arguments.repository)
+    source_repository = os.path.abspath(arguments.repository)
     manifest_path = os.path.abspath(arguments.manifest)
-    manifest = load_manifest(manifest_path, repository=repository)
+    manifest = load_manifest(manifest_path, repository=source_repository)
     output_directory = os.path.abspath(arguments.output)
-    os.makedirs(output_directory, exist_ok=True)
+    try:
+        output_within_repository = os.path.commonpath(
+            (os.path.realpath(source_repository), os.path.realpath(output_directory))
+        ) == os.path.realpath(source_repository)
+    except ValueError:
+        output_within_repository = False
+    if output_within_repository:
+        raise RuntimeError(
+            "run-corpus --output must be outside the source repository"
+        )
+    _initialize_output_directory(output_directory, arguments.resume)
     records_path = os.path.join(output_directory, "records.jsonl")
-    if os.path.exists(records_path) and not arguments.resume:
-        os.remove(records_path)
     run_id = arguments.run_id or str(uuid.uuid4())
-    metadata = machine_metadata(repository, arguments.manager, arguments.coqc)
     configuration = manifest["declared_configuration"]
-    _append_jsonl(
-        records_path,
-        {
-            "event": "run-start",
-            "schema": 1,
-            "run_id": run_id,
-            "mode": arguments.mode,
-            "manifest_sha256": _sha256_file(manifest_path),
-            "declared_configuration": configuration,
-            "machine": metadata,
-            "started_at": time.time(),
-        },
-    )
-    requested = set(arguments.case or ())
-    selected = [
-        case
-        for case in manifest["cases"]
-        if _case_selected(case, requested, arguments.case_pattern)
-    ]
-    if arguments.max_cases is not None:
-        selected = selected[: arguments.max_cases]
-    completed = set()
-    if arguments.resume:
-        completed = set(
-            item.get("case_id")
-            for item in _read_jsonl(records_path)
-            if item.get("event") == "case-end" and item.get("returncode") == 0
-        )
-    results = []
-    for index, case in enumerate(selected, 1):
-        if case["id"] in completed:
-            continue
-        print("[%d/%d] %s" % (index, len(selected), case["id"]), flush=True)
-        result = run_case(
-            repository,
-            output_directory,
+    work_directory = tempfile.mkdtemp(prefix="rdm-corpus-")
+    repository = os.path.join(work_directory, "repository")
+    try:
+        _create_isolated_repository(source_repository, repository)
+        # The user may choose another manifest, but its scripts and schema must
+        # describe this exact immutable checkout before any case is executed.
+        load_manifest(manifest_path, repository=repository)
+        metadata = machine_metadata(repository, arguments.manager, arguments.coqc)
+        _append_jsonl(
             records_path,
-            run_id,
-            case,
-            arguments.mode,
-            arguments.manager,
-            arguments.passing_manager,
-            os.path.abspath(arguments.python),
-            arguments.coqbin,
-            arguments.case_timeout,
+            {
+                "event": "run-start",
+                "schema": 1,
+                "run_id": run_id,
+                "mode": arguments.mode,
+                "manifest_sha256": _sha256_file(manifest_path),
+                "declared_configuration": configuration,
+                "machine": metadata,
+                "started_at": time.time(),
+            },
         )
-        results.append(result)
-        if result["returncode"] != 0 and arguments.fail_fast:
-            break
-    records = _read_jsonl(records_path)
-    summary = summarize_records(records, manifest)
-    summary.update({"run_id": run_id, "machine": metadata})
-    summary_path = os.path.join(output_directory, "summary.json")
-    with open(summary_path, "w", encoding="utf-8") as output:
-        json.dump(summary, output, indent=2, sort_keys=True)
-        output.write("\n")
-    _append_jsonl(
-        records_path,
-        {
-            "event": "run-end",
-            "schema": 1,
-            "run_id": run_id,
-            "summary_sha256": _sha256_file(summary_path),
-            "finished_at": time.time(),
-        },
-    )
-    print(json.dumps(summary, indent=2, sort_keys=True))
-    return 0 if all(summary["gates"].values()) else 2
+        requested = set(arguments.case or ())
+        selected = [
+            case
+            for case in manifest["cases"]
+            if _case_selected(case, requested, arguments.case_pattern)
+        ]
+        if arguments.max_cases is not None:
+            selected = selected[: arguments.max_cases]
+        completed = set()
+        if arguments.resume:
+            completed = set(
+                item.get("case_id")
+                for item in _read_jsonl(records_path)
+                if item.get("event") == "case-end" and item.get("returncode") == 0
+            )
+        for index, case in enumerate(selected, 1):
+            if case["id"] in completed:
+                continue
+            print("[%d/%d] %s" % (index, len(selected), case["id"]), flush=True)
+            result = run_case(
+                repository,
+                output_directory,
+                records_path,
+                run_id,
+                case,
+                arguments.mode,
+                arguments.manager,
+                arguments.passing_manager,
+                os.path.abspath(arguments.python),
+                arguments.coqbin,
+                arguments.case_timeout,
+            )
+            if result["returncode"] != 0 and arguments.fail_fast:
+                break
+        records = _read_jsonl(records_path)
+        summary = summarize_records(records, manifest)
+        summary.update({"run_id": run_id, "machine": metadata})
+        summary_path = os.path.join(output_directory, "summary.json")
+        summary_payload = (
+            json.dumps(summary, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        summary_descriptor = _open_regular_file(
+            summary_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        )
+        try:
+            _write_all(summary_descriptor, summary_payload)
+        finally:
+            os.close(summary_descriptor)
+        _append_jsonl(
+            records_path,
+            {
+                "event": "run-end",
+                "schema": 1,
+                "run_id": run_id,
+                "summary_sha256": _sha256_file(summary_path),
+                "finished_at": time.time(),
+            },
+        )
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0 if all(summary["gates"].values()) else 2
+    finally:
+        active_exception = sys.exc_info()[0] is not None
+        try:
+            shutil.rmtree(work_directory)
+        except OSError as exc:
+            message = "Unable to remove disposable corpus clone %s: %s" % (
+                work_directory,
+                exc,
+            )
+            if not active_exception:
+                raise RuntimeError(message)
+            try:
+                print("Warning: " + message, file=sys.stderr)
+            except BaseException:
+                pass
 
 
 def _benchmark_source(definitions, spin=0):
@@ -929,7 +1121,15 @@ def build_parser():
     validate.add_argument("--manifest", default=DEFAULT_MANIFEST)
     validate.set_defaults(action=validate_command)
 
-    corpus = subparsers.add_parser("run-corpus")
+    corpus = subparsers.add_parser(
+        "run-corpus",
+        description=(
+            "Run committed HEAD in a disposable clone. Caller untracked and "
+            "ignored files are not copied or cleaned; logs and generated "
+            "outputs are retained only under --output, which must be outside "
+            "the source repository and newly created unless --resume is used."
+        ),
+    )
     corpus.add_argument("--manifest", default=DEFAULT_MANIFEST)
     corpus.add_argument("--output", required=True)
     corpus.add_argument("--mode", choices=("rdm-shadow", "rdm-hybrid"), default="rdm-shadow")
