@@ -23,6 +23,7 @@ from .candidate_evaluator import (
     LegacyTargetPolicy,
     ResourceRequest,
 )
+from .rdm_backend import RdmShadowEvaluator
 from .coq_running_support import (
     get_default_options_settings,
     get_ltac_support_snippet,
@@ -138,6 +139,38 @@ parser.add_argument(
     type=str,
     default="",
     help="a .log file which will contain the log from coqc from the last temp_file that failed",
+)
+parser.add_argument(
+    "--backend",
+    choices=("coqc", "rdm-shadow"),
+    default="coqc",
+    help=(
+        "Candidate evaluation backend.  rdm-shadow runs the document "
+        "manager observationally while coqc remains authoritative."
+    ),
+)
+parser.add_argument(
+    "--rdm",
+    default="rocq-doc-manager",
+    help="Path to the rocq-doc-manager executable used in shadow mode.",
+)
+parser.add_argument(
+    "--passing-rdm",
+    default=None,
+    help=(
+        "Path to the passing rocq-doc-manager executable; defaults to "
+        "--rdm."
+    ),
+)
+parser.add_argument(
+    "--rdm-restart-every",
+    type=int,
+    default=0,
+    metavar="N",
+    help=(
+        "Restart each shadow document session after N candidate attempts "
+        "(0 disables periodic restart)."
+    ),
 )
 parser.add_argument(
     "--fast-merge-imports",
@@ -1349,6 +1382,7 @@ def _candidate_context_spec(logical_file_name, passing=False, **kwargs):
         checker_executable=kwargs.get(checker_key),
         checker_arguments=kwargs.get(checker_arguments_key, ()),
         resource_request=resource_request,
+        role="passing" if passing else "primary",
     )
 
 
@@ -4538,6 +4572,14 @@ def main():
         "cgroup": args.cgroup,
         "mem_limit_method": args.mem_limit_method,
         "minimize_args": args.minimize_args,
+        "backend": args.backend,
+        "rdm": (args.rdm,),
+        "passing_rdm": (
+            (args.passing_rdm,)
+            if args.passing_rdm is not None
+            else (args.rdm,)
+        ),
+        "rdm_restart_every": args.rdm_restart_every,
     }
     candidate_check_coordinator = None
 
@@ -4577,6 +4619,13 @@ def main():
                     level=LOG_ALWAYS,
                 )
                 sys.exit(1)
+        if env["rdm_restart_every"] < 0:
+            env["log"](
+                "\nError: --rdm-restart-every must not be negative.",
+                force_stdout=True,
+                level=LOG_ALWAYS,
+            )
+            sys.exit(1)
         if env["mem_limit_method"] == "ulimit" and env["max_mem_rss"] is not None:
             env["log"](
                 "\nWarning: --mem-limit-method=ulimit does not support --max-mem-rss. "
@@ -4850,9 +4899,10 @@ def main():
 
         env["inlined_requires"] = set()
 
-        evaluator = CoqcEvaluator(log=env["log"], verbose_base=2)
-        candidate_check_coordinator = CandidateCheckCoordinator(evaluator)
-        env["candidate_check_coordinator"] = candidate_check_coordinator
+        if env["backend"] == "coqc":
+            evaluator = CoqcEvaluator(log=env["log"], verbose_base=2)
+            candidate_check_coordinator = CandidateCheckCoordinator(evaluator)
+            env["candidate_check_coordinator"] = candidate_check_coordinator
 
         add_admit_tactic_wrapper = make_add_admit_tactic_wrapper(**env)
 
@@ -4897,6 +4947,49 @@ def main():
                         "The computed error message was not present in the given error log.",
                         **env,
                     )
+
+        if env["backend"] == "rdm-shadow":
+            compiler_evaluator = CoqcEvaluator(log=env["log"], verbose_base=2)
+            target_policy = LegacyTargetPolicy(
+                env["should_succeed"], env.get("error_reg_string")
+            )
+            evaluator = RdmShadowEvaluator(
+                compiler_evaluator,
+                env["rdm"],
+                inlined_contents,
+                target_policy,
+                passing_manager=env["passing_rdm"],
+                restart_every=env["rdm_restart_every"],
+                cwd=env.get("base_dir"),
+                environment=EnvironmentSnapshot(
+                    dict(os.environ), ocamlpath=env.get("nonpassing_ocamlpath")
+                ).as_dict(),
+                log=env["log"],
+            )
+            document_evaluator = evaluator.document_evaluator
+            for role, probe in (
+                ("primary", document_evaluator.primary_probe),
+                ("passing", document_evaluator.passing_probe),
+            ):
+                if probe is not None:
+                    env["log"](
+                        "rdm-shadow %s manager: %s (sha256=%s, capabilities=%d, missing=%s)"
+                        % (
+                            role,
+                            probe.resolved_executable,
+                            probe.sha256,
+                            len(probe.methods),
+                            probe.missing_methods,
+                        ),
+                        level=1,
+                    )
+            for role, error in document_evaluator.probe_errors:
+                env["log"](
+                    "rdm-shadow %s manager unavailable: %s" % (role, error),
+                    level=1,
+                )
+            candidate_check_coordinator = CandidateCheckCoordinator(evaluator)
+            env["candidate_check_coordinator"] = candidate_check_coordinator
 
         if not env["minimize_before_inlining"]:
             env["log"](

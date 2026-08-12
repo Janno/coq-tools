@@ -103,9 +103,9 @@ jobs:
     - name: Import package and compile evaluator seam
       run: |
         python -c 'import coq_tools.candidate_evaluator; import coq_tools.find_bug'
-        python -m compileall coq_tools tests/test_candidate_evaluator.py tests/test_find_bug_candidate_checks.py tests/test_diagnose_error.py
+        python -m compileall coq_tools tests/test_candidate_evaluator.py tests/test_find_bug_candidate_checks.py tests/test_diagnose_error.py tests/test_rdm_backend.py
     - name: Run pure evaluator and candidate-check tests
-      run: python -m pytest tests/test_candidate_evaluator.py tests/test_find_bug_candidate_checks.py tests/test_diagnose_error.py
+      run: python -m pytest tests/test_candidate_evaluator.py tests/test_find_bug_candidate_checks.py tests/test_diagnose_error.py tests/test_rdm_backend.py
 
   opam-build:
     strategy:

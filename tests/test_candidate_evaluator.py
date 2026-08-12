@@ -57,6 +57,7 @@ def _context(spec, identity="fake"):
         spec.checker_executable,
         spec.checker_arguments,
         _policy(spec.resource_request),
+        role=spec.role,
     )
 
 
@@ -140,6 +141,30 @@ def test_environment_and_specs_are_deeply_immutable_and_redacted(tmp_path):
         os.environ.pop("ENVIRONMENT_SNAPSHOT_TEST", None)
 
 
+def test_context_role_defaults_to_primary_and_participates_in_identity():
+    primary = _spec()
+    passing = EvaluationContextSpec(
+        primary.executable,
+        primary.arguments,
+        cwd=primary.cwd,
+        environment=primary.environment,
+        logical_file=primary.logical_file,
+        resource_request=primary.resource_request,
+        role="passing",
+    )
+    assert primary.role == "primary"
+    assert passing.role == "passing"
+    assert primary != passing
+    assert _context(primary).role == "primary"
+    assert _context(passing).role == "passing"
+    with pytest.raises(ValueError, match="role"):
+        EvaluationContextSpec(
+            ("coqc",),
+            environment={"PATH": ""},
+            role="unknown",
+        )
+
+
 def test_evaluation_status_and_legacy_tuple_are_stable():
     evaluation = Evaluation(
         EvaluationStatus.CRASH,
@@ -160,6 +185,7 @@ def test_evaluation_status_and_legacy_tuple_are_stable():
     assert set(EvaluationStatus.ALL) == {
         "success",
         "command_error",
+        "parse_error",
         "timeout",
         "out_of_memory",
         "crash",
@@ -379,6 +405,24 @@ def test_candidate_debug_retry_resolves_memory_from_latest_peak(monkeypatch):
     retry_plan = calls[1]["memory_plan"]
     assert retry_plan.compiler_max_mem_rss == 600
     assert retry_plan.compiler_max_mem_as == 1200
+
+
+def test_reporting_hook_failure_does_not_change_candidate_decision():
+    evaluator = RecordingEvaluator([_evaluation("TARGET")])
+
+    def broken_reporting_hook(*args, **kwargs):
+        raise RuntimeError("reporting failed")
+
+    evaluator.record_target_decision = broken_reporting_hook
+    coordinator = CandidateCheckCoordinator(evaluator)
+    verdict = coordinator.begin_candidate(
+        "candidate",
+        _spec(),
+        None,
+        LegacyTargetPolicy(False, "TARGET"),
+    )
+    assert verdict.result_type == CHANGE_SUCCESS
+    coordinator.discard_candidate(verdict.attempt)
 
 
 def test_coordinator_primary_passing_cache_bypass_and_reverse_discard():

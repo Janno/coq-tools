@@ -91,6 +91,7 @@ class FakeEvaluator(CandidateEvaluator):
             spec.checker_executable,
             spec.checker_arguments,
             policy,
+            role=spec.role,
         )
 
     def begin(self, context, source):
@@ -534,6 +535,7 @@ def test_primary_and_passing_specs_capture_all_role_shaping_fields(tmp_path):
         str(tmp_path / "out.v"), passing=True, **env
     )
     assert primary.arguments == ("-primary",)
+    assert primary.role == "primary"
     assert primary.resource_request.requested_timeout == 3
     assert primary.environment.as_dict()["OCAMLPATH"] == "primary-ocaml"
     assert primary.is_toplevel
@@ -541,6 +543,7 @@ def test_primary_and_passing_specs_capture_all_role_shaping_fields(tmp_path):
     assert primary.checker_arguments == ("-primary-check",)
     assert passing.executable == ("passing",)
     assert passing.arguments == ("-passing",)
+    assert passing.role == "passing"
     assert passing.resource_request.requested_timeout == 7
     assert passing.cwd == str(tmp_path / "passing-cwd")
     assert passing.environment.as_dict()["OCAMLPATH"] == "passing-ocaml"

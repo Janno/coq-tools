@@ -338,6 +338,7 @@ _EvaluationContextSpecBase = _tuple_value(
         "checker_executable",
         "checker_arguments",
         "resource_request",
+        "role",
     ),
 )
 
@@ -358,6 +359,7 @@ class EvaluationContextSpec(_EvaluationContextSpecBase):
         checker_executable=None,
         checker_arguments=(),
         resource_request=None,
+        role="primary",
     ):
         normalized_cwd = _normalize_cwd(cwd)
         executable = tuple(_freeze(item) for item in executable)
@@ -377,6 +379,8 @@ class EvaluationContextSpec(_EvaluationContextSpecBase):
             resource_request = _coerce_resource_request(resource_request)
         if top_name is None:
             top_name = _derive_top_name(arguments, logical_file)
+        if role not in ("primary", "passing"):
+            raise ValueError("Unknown evaluation context role %r" % (role,))
         return _EvaluationContextSpecBase.__new__(
             cls,
             executable,
@@ -390,6 +394,7 @@ class EvaluationContextSpec(_EvaluationContextSpecBase):
             checker_executable,
             checker_arguments,
             resource_request,
+            _freeze(role),
         )
 
 
@@ -410,6 +415,7 @@ _EvaluationContextBase = _tuple_value(
         "checker_executable_identity",
         "checker_arguments",
         "resource_policy",
+        "role",
     ),
 )
 
@@ -433,6 +439,7 @@ class EvaluationContext(_EvaluationContextBase):
         resource_policy,
         executable_identity=None,
         checker_executable_identity=None,
+        role="primary",
     ):
         executable = tuple(_freeze(item) for item in executable)
         arguments = tuple(_freeze(item) for item in arguments)
@@ -452,6 +459,8 @@ class EvaluationContext(_EvaluationContextBase):
             if checker_executable is None
             else tuple(_freeze(item) for item in checker_executable)
         )
+        if role not in ("primary", "passing"):
+            raise ValueError("Unknown evaluation context role %r" % (role,))
         if (
             normalized_checker is not None
             and checker_executable_identity is None
@@ -475,12 +484,14 @@ class EvaluationContext(_EvaluationContextBase):
             _freeze(checker_executable_identity),
             tuple(_freeze(item) for item in checker_arguments),
             resource_policy,
+            _freeze(role),
         )
 
 
 class EvaluationStatus(object):
     SUCCESS = "success"
     COMMAND_ERROR = "command_error"
+    PARSE_ERROR = "parse_error"
     TIMEOUT = "timeout"
     OUT_OF_MEMORY = "out_of_memory"
     CRASH = "crash"
@@ -489,6 +500,7 @@ class EvaluationStatus(object):
     ALL = (
         SUCCESS,
         COMMAND_ERROR,
+        PARSE_ERROR,
         TIMEOUT,
         OUT_OF_MEMORY,
         CRASH,
@@ -732,6 +744,10 @@ class CandidateEvaluator(object):
     def reset_calibration(self, context=None):
         raise NotImplementedError
 
+    def record_target_decision(self, trial, target_policy, role):
+        """Optional reporting hook; it must not influence the decision."""
+        return None
+
     def close(self):
         raise NotImplementedError
 
@@ -834,6 +850,7 @@ class CoqcEvaluator(CandidateEvaluator):
             spec.checker_executable,
             spec.checker_arguments,
             policy,
+            role=spec.role,
         )
 
     @staticmethod
@@ -906,6 +923,7 @@ class CoqcEvaluator(CandidateEvaluator):
                 checker_executable=context.checker_executable,
                 checker_arguments=context.checker_arguments,
                 resource_request=context.resource_policy.request,
+                role=context.role,
             )
             final_context = self.materialize_context(retry_spec)
             retry_result = self._run(final_context, source)
@@ -1043,6 +1061,14 @@ class CandidateCheckCoordinator(object):
         passing_cached = False
         try:
             primary_preserves = target_policy.primary_preserves(primary_evaluation)
+            if not primary_cached:
+                try:
+                    self.evaluator.record_target_decision(
+                        primary_trial, target_policy, primary_context.role
+                    )
+                except BaseException:
+                    # A reporting-only hook must never become decision authority.
+                    pass
             if (
                 primary_preserves
                 and not target_policy.should_succeed
@@ -1056,6 +1082,13 @@ class CandidateCheckCoordinator(object):
                 passing_succeeds = target_policy.passing_succeeds(
                     passing_evaluation
                 )
+                if not passing_cached:
+                    try:
+                        self.evaluator.record_target_decision(
+                            passing_trial, target_policy, passing_context.role
+                        )
+                    except BaseException:
+                        pass
             else:
                 passing_succeeds = True
         except BaseException:
