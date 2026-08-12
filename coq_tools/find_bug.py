@@ -16,14 +16,21 @@ from .binding_util import process_maybe_list
 from .candidate_evaluator import (
     CandidateCheckCoordinator,
     CandidateDecision,
+    CandidateEvaluatorError,
     CoqcEvaluator,
     EnvironmentSnapshot,
     EvaluationContextSpec,
     EvaluationVerdict,
     LegacyTargetPolicy,
     ResourceRequest,
+    StrictHybridTargetPolicy,
 )
-from .rdm_backend import RdmShadowEvaluator
+from .rdm_backend import (
+    DEFAULT_HYBRID_RESTART_EVERY,
+    DEFAULT_REQUEST_TIMEOUT,
+    RdmHybridEvaluator,
+    RdmShadowEvaluator,
+)
 from .coq_running_support import (
     get_default_options_settings,
     get_ltac_support_snippet,
@@ -142,11 +149,12 @@ parser.add_argument(
 )
 parser.add_argument(
     "--backend",
-    choices=("coqc", "rdm-shadow"),
+    choices=("coqc", "rdm-shadow", "rdm-hybrid"),
     default="coqc",
     help=(
-        "Candidate evaluation backend.  rdm-shadow runs the document "
-        "manager observationally while coqc remains authoritative."
+        "Candidate evaluation backend. rdm-shadow observes while coqc "
+        "decides every candidate; experimental rdm-hybrid may reject "
+        "candidates early but coqc confirms every accepted edit and final output."
     ),
 )
 parser.add_argument(
@@ -165,11 +173,29 @@ parser.add_argument(
 parser.add_argument(
     "--rdm-restart-every",
     type=int,
+    default=None,
+    metavar="N",
+    help=(
+        "Restart each document session after N candidate attempts. By default "
+        "shadow disables periodic restart and hybrid restarts every %d attempts; "
+        "0 disables it explicitly." % DEFAULT_HYBRID_RESTART_EVERY
+    ),
+)
+parser.add_argument(
+    "--rdm-request-timeout",
+    type=float,
+    default=DEFAULT_REQUEST_TIMEOUT,
+    metavar="SECONDS",
+    help="Maximum wall-clock time for manager startup or one document transaction.",
+)
+parser.add_argument(
+    "--rdm-hybrid-check-rejected-every",
+    type=int,
     default=0,
     metavar="N",
     help=(
-        "Restart each shadow document session after N candidate attempts "
-        "(0 disables periodic restart)."
+        "In hybrid mode, confirm every Nth would-be fast rejection with coqc "
+        "to detect false negatives (0 disables audits)."
     ),
 )
 parser.add_argument(
@@ -1445,9 +1471,11 @@ def classify_contents_change(
         if kwargs.get("passing_coqc")
         else None
     )
-    target_policy = LegacyTargetPolicy(
-        should_succeed, kwargs.get("error_reg_string")
-    )
+    target_policy = kwargs.get("candidate_target_policy")
+    if target_policy is None:
+        target_policy = LegacyTargetPolicy(
+            should_succeed, kwargs.get("error_reg_string")
+        )
     verdict = coordinator.begin_candidate(
         new_contents,
         primary_spec,
@@ -1697,6 +1725,55 @@ def check_change_and_write_to_file(
         level=LOG_ALWAYS,
     )
     return None
+
+
+def verify_final_hybrid_checkpoint(coordinator, log):
+    """Freshly verify the latest compiler-confirmed raw checkpoint."""
+    checkpoint = coordinator.last_checkpoint
+    if checkpoint is None:
+        raise CandidateEvaluatorError(
+            "Hybrid final verification has no accepted checkpoint"
+        )
+    evaluator = CoqcEvaluator(log=log, verbose_base=2)
+    trials = []
+    try:
+        primary = evaluator.begin(
+            checkpoint.primary_context,
+            checkpoint.raw_source,
+            checkpoint.target_policy,
+        )
+        trials.append(primary)
+        if not checkpoint.target_policy.primary_preserves(primary.evaluation):
+            raise CandidateEvaluatorError(
+                "Hybrid final primary compiler verification failed:\n%s"
+                % primary.evaluation.output
+            )
+        if checkpoint.passing_context is not None:
+            passing = evaluator.begin(
+                checkpoint.passing_context,
+                checkpoint.raw_source,
+                checkpoint.target_policy,
+            )
+            trials.append(passing)
+            if not checkpoint.target_policy.passing_succeeds(passing.evaluation):
+                raise CandidateEvaluatorError(
+                    "Hybrid final passing compiler verification failed:\n%s"
+                    % passing.evaluation.output
+                )
+        log("rdm-hybrid final compiler verification succeeded", level=1)
+    finally:
+        active_exception = sys.exc_info()[0] is not None
+        for trial in reversed(trials):
+            try:
+                evaluator.finish(trial, False)
+            except BaseException:
+                if not active_exception:
+                    raise
+        try:
+            evaluator.close()
+        except BaseException:
+            if not active_exception:
+                raise
 
 
 # Cache for tracking failed edit suffixes when --faster-skip-repeat-edit-suffixes is enabled
@@ -3521,6 +3598,7 @@ def try_minimize_coqc_args(output_file_name, **env):
         env["log"]("Updated output file with minimized arguments")
     else:
         env["log"]("No arguments could be removed")
+    return new_args, contents
 
 
 def minimize_file(
@@ -4579,7 +4657,16 @@ def main():
             if args.passing_rdm is not None
             else (args.rdm,)
         ),
-        "rdm_restart_every": args.rdm_restart_every,
+        "rdm_restart_every": (
+            DEFAULT_HYBRID_RESTART_EVERY
+            if args.rdm_restart_every is None
+            and args.backend == "rdm-hybrid"
+            else (args.rdm_restart_every or 0)
+        ),
+        "rdm_request_timeout": args.rdm_request_timeout,
+        "rdm_hybrid_check_rejected_every": (
+            args.rdm_hybrid_check_rejected_every
+        ),
     }
     candidate_check_coordinator = None
 
@@ -4626,6 +4713,41 @@ def main():
                 level=LOG_ALWAYS,
             )
             sys.exit(1)
+        if (
+            not math.isfinite(env["rdm_request_timeout"])
+            or env["rdm_request_timeout"] <= 0
+        ):
+            env["log"](
+                "\nError: --rdm-request-timeout must be finite and positive.",
+                force_stdout=True,
+                level=LOG_ALWAYS,
+            )
+            sys.exit(1)
+        if env["rdm_hybrid_check_rejected_every"] < 0:
+            env["log"](
+                "\nError: --rdm-hybrid-check-rejected-every must not be negative.",
+                force_stdout=True,
+                level=LOG_ALWAYS,
+            )
+            sys.exit(1)
+        if env["backend"] == "rdm-hybrid":
+            env["log"](
+                "rdm-hybrid is experimental: coqc confirms every accepted "
+                "edit and the final output; document false negatives may miss reductions. "
+                "request_timeout=%s restart_every=%s rejected_audit_every=%s"
+                % (
+                    env["rdm_request_timeout"],
+                    env["rdm_restart_every"],
+                    env["rdm_hybrid_check_rejected_every"],
+                ),
+                level=1,
+            )
+            if env["rdm_restart_every"] == 0:
+                env["log"](
+                    "Warning: hybrid periodic restart is explicitly disabled; "
+                    "long-session cursor retention is not bounded.",
+                    level=1,
+                )
         if env["mem_limit_method"] == "ulimit" and env["max_mem_rss"] is not None:
             env["log"](
                 "\nWarning: --mem-limit-method=ulimit does not support --max-mem-rss. "
@@ -4948,23 +5070,40 @@ def main():
                         **env,
                     )
 
-        if env["backend"] == "rdm-shadow":
+        if env["backend"] in ("rdm-shadow", "rdm-hybrid"):
             compiler_evaluator = CoqcEvaluator(log=env["log"], verbose_base=2)
-            target_policy = LegacyTargetPolicy(
+            policy_type = (
+                StrictHybridTargetPolicy
+                if env["backend"] == "rdm-hybrid"
+                else LegacyTargetPolicy
+            )
+            target_policy = policy_type(
                 env["should_succeed"], env.get("error_reg_string")
             )
-            evaluator = RdmShadowEvaluator(
+            evaluator_type = (
+                RdmHybridEvaluator
+                if env["backend"] == "rdm-hybrid"
+                else RdmShadowEvaluator
+            )
+            evaluator_kwargs = {}
+            if env["backend"] == "rdm-hybrid":
+                evaluator_kwargs["check_rejected_every"] = env[
+                    "rdm_hybrid_check_rejected_every"
+                ]
+            evaluator = evaluator_type(
                 compiler_evaluator,
                 env["rdm"],
                 inlined_contents,
                 target_policy,
                 passing_manager=env["passing_rdm"],
                 restart_every=env["rdm_restart_every"],
+                request_timeout=env["rdm_request_timeout"],
                 cwd=env.get("base_dir"),
                 environment=EnvironmentSnapshot(
                     dict(os.environ), ocamlpath=env.get("nonpassing_ocamlpath")
                 ).as_dict(),
                 log=env["log"],
+                **evaluator_kwargs,
             )
             document_evaluator = evaluator.document_evaluator
             for role, probe in (
@@ -4973,8 +5112,9 @@ def main():
             ):
                 if probe is not None:
                     env["log"](
-                        "rdm-shadow %s manager: %s (sha256=%s, capabilities=%d, missing=%s)"
+                        "%s %s manager: %s (sha256=%s, capabilities=%d, missing=%s)"
                         % (
+                            env["backend"],
                             role,
                             probe.resolved_executable,
                             probe.sha256,
@@ -4985,11 +5125,13 @@ def main():
                     )
             for role, error in document_evaluator.probe_errors:
                 env["log"](
-                    "rdm-shadow %s manager unavailable: %s" % (role, error),
+                    "%s %s manager unavailable: %s"
+                    % (env["backend"], role, error),
                     level=1,
                 )
             candidate_check_coordinator = CandidateCheckCoordinator(evaluator)
             env["candidate_check_coordinator"] = candidate_check_coordinator
+            env["candidate_target_policy"] = target_policy
 
         if not env["minimize_before_inlining"]:
             env["log"](
@@ -5095,7 +5237,19 @@ def main():
         # At the very end of minimization, try to remove unnecessary
         # command-line arguments
         if env["minimize_args"]:
-            try_minimize_coqc_args(output_file_name, **env)
+            minimized_args, minimized_raw = try_minimize_coqc_args(
+                output_file_name, **env
+            )
+            if minimized_args != env["coqc_args"]:
+                # The accepted argument-removal transaction already stored its
+                # exact context in the coordinator checkpoint.  Propagate the
+                # effective tuple for subsequent run-level reporting only.
+                env["coqc_args"] = minimized_args
+
+        if env["backend"] == "rdm-hybrid":
+            verify_final_hybrid_checkpoint(
+                candidate_check_coordinator, env["log"]
+            )
 
     except EOFError:
         env["log"](traceback.format_exc(), level=LOG_ALWAYS)

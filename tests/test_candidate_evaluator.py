@@ -12,6 +12,7 @@ from coq_tools.candidate_evaluator import (
     CandidateCheckCoordinator,
     CandidateCoordinatorUnhealthy,
     CandidateEvaluator,
+    CandidateEvaluatorError,
     CandidateFinalizationError,
     CandidateLifecycleError,
     CoqcEvaluator,
@@ -25,6 +26,7 @@ from coq_tools.candidate_evaluator import (
     MemoryLimitPlan,
     ResourcePolicy,
     ResourceRequest,
+    StrictHybridTargetPolicy,
     TimeoutPolicy,
 )
 
@@ -84,7 +86,7 @@ class RecordingEvaluator(CandidateEvaluator):
         self.materialized.append(spec)
         return _context(spec, self.identity)
 
-    def begin(self, context, source):
+    def begin(self, context, source, target_policy=None):
         evaluation = self.outputs.pop(0)
         token = len(self.begun)
         trial = EvaluationTrial(evaluation, token, True, False)
@@ -103,7 +105,9 @@ class RecordingEvaluator(CandidateEvaluator):
         self.closed = True
 
 
-def _spec(name="coqc", timeout=None, multiplier=None, environment=None):
+def _spec(
+    name="coqc", timeout=None, multiplier=None, environment=None, role="primary"
+):
     executable = (name,)
     return EvaluationContextSpec(
         executable,
@@ -115,6 +119,7 @@ def _spec(name="coqc", timeout=None, multiplier=None, environment=None):
             max_mem_rss_multiplier=multiplier,
             memory_usage_key=executable,
         ),
+        role=role,
     )
 
 
@@ -433,7 +438,16 @@ def test_coordinator_primary_passing_cache_bypass_and_reverse_discard():
     coordinator = CandidateCheckCoordinator(evaluator)
     policy = LegacyTargetPolicy(False, "target")
     primary_spec = _spec("bad")
-    passing_spec = _spec("good")
+    passing_spec = EvaluationContextSpec(
+        ("good",),
+        ("-q",),
+        environment={"PATH": os.environ.get("PATH", "")},
+        logical_file="candidate.v",
+        resource_request=ResourceRequest(
+            None, memory_usage_key=("good",)
+        ),
+        role="passing",
+    )
 
     first = coordinator.begin_candidate(
         "source", primary_spec, passing_spec, policy
@@ -462,7 +476,7 @@ def test_coordinator_primary_passing_cache_bypass_and_reverse_discard():
 def test_coordinator_separates_target_decisions_and_stateful_cached_acceptance():
     target_output = 'File "x.v", line 1, characters 0-1:\nError:\ntarget\n'
     target_observation = _evaluation(target_output, returncode=1)
-    evaluator = RecordingEvaluator([target_observation])
+    evaluator = RecordingEvaluator([target_observation, target_observation])
     coordinator = CandidateCheckCoordinator(evaluator)
     failure_mode = coordinator.begin_candidate(
         "source", _spec(), None, LegacyTargetPolicy(False, "target")
@@ -473,7 +487,7 @@ def test_coordinator_separates_target_decisions_and_stateful_cached_acceptance()
         "source", _spec(), None, LegacyTargetPolicy(True, None)
     )
     assert success_mode.result_type == CHANGE_FAILURE
-    assert len(evaluator.begun) == 1
+    assert len(evaluator.begun) == 2
     coordinator.discard_candidate(success_mode.attempt)
     assert len(coordinator.decision_cache) == 2
 
@@ -522,7 +536,7 @@ def test_coordinator_conditional_passing_and_partial_failure_cleanup():
         coordinator.begin_candidate(
             "source",
             _spec("bad"),
-            _spec("good"),
+            _spec("good", role="passing"),
             LegacyTargetPolicy(False, "target"),
         )
     assert failing.finished == [(0, False)]
@@ -530,7 +544,7 @@ def test_coordinator_conditional_passing_and_partial_failure_cleanup():
 
 def test_reset_precedes_materialization_and_resource_side_effects_skip_cache():
     success = _evaluation("ok")
-    evaluator = RecordingEvaluator([success, success])
+    evaluator = RecordingEvaluator([success])
     coordinator = CandidateCheckCoordinator(evaluator)
     spec = _spec(timeout=0)
     first = coordinator.begin_candidate(
@@ -569,7 +583,7 @@ def test_exactly_once_and_accepted_finalization_failure_checkpoint():
     verdict = coordinator.begin_candidate(
         "raw",
         _spec("bad"),
-        _spec("good"),
+        _spec("good", role="passing"),
         LegacyTargetPolicy(False, "target"),
     )
     with pytest.raises(CandidateFinalizationError) as excinfo:
@@ -587,7 +601,7 @@ def test_fresh_observation_invalidates_decisions_for_every_policy():
     target = _evaluation(
         'File "x.v", line 1, characters 0-1:\nError:\ntarget\n', 1
     )
-    evaluator = RecordingEvaluator([ok, target])
+    evaluator = RecordingEvaluator([ok, ok, target, target])
     coordinator = CandidateCheckCoordinator(evaluator)
     spec = _spec()
     target_policy = LegacyTargetPolicy(False, "target")
@@ -606,8 +620,9 @@ def test_fresh_observation_invalidates_decisions_for_every_policy():
     assert refreshed.result_type == CHANGE_SUCCESS
     coordinator.discard_candidate(refreshed.attempt)
     rematched = coordinator.begin_candidate("source", spec, None, success_policy)
-    assert rematched.result_type == CHANGE_FAILURE
+    assert rematched.result_type == CHANGE_SUCCESS
     coordinator.discard_candidate(rematched.attempt)
+    assert len(evaluator.begun) == 3
 
 
 def test_resource_forced_fresh_observation_recomputes_decision():
@@ -802,3 +817,65 @@ def test_candidate_debug_probe_uses_frozen_relative_path_and_cwd(tmp_path, monke
     assert trial.evaluation.output.strip() == "final"
     assert trial.evaluation.status == EvaluationStatus.SUCCESS
     assert not list(tmp_path.glob("*.v"))
+
+
+def test_strict_hybrid_policy_requires_status_and_zero_returncode():
+    policy = StrictHybridTargetPolicy(True, None)
+    assert policy.primary_preserves(_evaluation("", 0))
+    assert not policy.primary_preserves(_evaluation("", 1))
+    assert not policy.primary_preserves(
+        Evaluation(EvaluationStatus.TIMEOUT, "Timeout!", (), 0)
+    )
+    target = StrictHybridTargetPolicy(False, "target")
+    assert target.primary_preserves(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: target", (), 1)
+    )
+    assert not target.primary_preserves(
+        Evaluation(EvaluationStatus.TIMEOUT, "Error: target", (), 1)
+    )
+
+
+def test_target_policy_identity_participates_in_observation_cache():
+    evaluator = RecordingEvaluator([_evaluation("ok"), _evaluation("ok")])
+    coordinator = CandidateCheckCoordinator(evaluator)
+    spec = _spec()
+    first = coordinator.begin_candidate(
+        "source", spec, None, LegacyTargetPolicy(True, None)
+    )
+    coordinator.discard_candidate(first.attempt)
+    second = coordinator.begin_candidate(
+        "source", spec, None, StrictHybridTargetPolicy(True, None)
+    )
+    coordinator.discard_candidate(second.attempt)
+    assert len(evaluator.begun) == 2
+
+
+def test_acceptance_can_invalidate_baseline_dependent_caches():
+    class BaselineEvaluator(RecordingEvaluator):
+        @property
+        def invalidates_cache_after_accept(self):
+            return True
+
+    evaluator = BaselineEvaluator([_evaluation("ok"), _evaluation("ok")])
+    coordinator = CandidateCheckCoordinator(evaluator)
+    policy = LegacyTargetPolicy(True, None)
+    first = coordinator.begin_candidate("source", _spec(), None, policy)
+    coordinator.commit_candidate(first.attempt, "serialized", "out.v")
+    assert coordinator.observation_cache == {}
+    second = coordinator.begin_candidate("source", _spec(), None, policy)
+    coordinator.discard_candidate(second.attempt)
+    assert len(evaluator.begun) == 2
+
+
+def test_explicit_acceptance_authorization_blocks_document_only_success():
+    class RejectingAuthority(RecordingEvaluator):
+        def acceptance_authorized(self, trial, target_policy, role):
+            return False
+
+    evaluator = RejectingAuthority([_evaluation("ok")])
+    coordinator = CandidateCheckCoordinator(evaluator)
+    with pytest.raises(CandidateEvaluatorError, match="reference oracle"):
+        coordinator.begin_candidate(
+            "source", _spec(), None, LegacyTargetPolicy(True, None)
+        )
+    assert evaluator.finished == [(0, False)]

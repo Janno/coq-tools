@@ -10,6 +10,7 @@ from coq_tools.candidate_evaluator import (
     CHANGE_SUCCESS,
     CONTENTS_UNCHANGED,
     CandidateCheckCoordinator,
+    CandidateCheckpoint,
     CandidateEvaluator,
     CandidateFinalizationError,
     Evaluation,
@@ -94,7 +95,7 @@ class FakeEvaluator(CandidateEvaluator):
             role=spec.role,
         )
 
-    def begin(self, context, source):
+    def begin(self, context, source, target_policy=None):
         self.events.append("begin:%s" % context.executable[0])
         result = self.observations.pop(0)
         token = self.begin_count
@@ -112,6 +113,49 @@ class FakeEvaluator(CandidateEvaluator):
 
     def close(self):
         self.events.append("close")
+
+
+def test_final_hybrid_verification_is_fresh_and_checks_both_roles(monkeypatch):
+    events = []
+    policy = find_bug.StrictHybridTargetPolicy(False, "target")
+    primary = object()
+    passing = object()
+    coordinator = type("Coordinator", (), {})()
+    coordinator.last_checkpoint = CandidateCheckpoint(
+        "raw",
+        "serialized",
+        "out.v",
+        primary,
+        passing,
+        policy,
+    )
+
+    class Verifier(object):
+        def __init__(self, log, verbose_base=2):
+            events.append("construct")
+
+        def begin(self, context, source, target_policy=None):
+            events.append(("begin", context, source, target_policy))
+            if context is primary:
+                value = Evaluation(
+                    EvaluationStatus.COMMAND_ERROR, ERROR_TARGET, (), 1
+                )
+            else:
+                value = Evaluation(EvaluationStatus.SUCCESS, "", (), 0)
+            return EvaluationTrial(value, context, False, False)
+
+        def finish(self, trial, accepted):
+            events.append(("finish", trial.token, accepted))
+
+        def close(self):
+            events.append("close")
+
+    monkeypatch.setattr(find_bug, "CoqcEvaluator", Verifier)
+    find_bug.verify_final_hybrid_checkpoint(
+        coordinator, lambda *args, **kwargs: None
+    )
+    assert [event[1] for event in events if isinstance(event, tuple) and event[0] == "begin"] == [primary, passing]
+    assert events[-1] == "close"
 
 
 def make_env(tmp_path, observations, passing=False, events=None):

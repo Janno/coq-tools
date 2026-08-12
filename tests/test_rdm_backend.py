@@ -46,6 +46,7 @@ def _make_fake_server(tmp_path):
             import json
             import os
             import sys
+            import time
 
             scenario = sys.argv[1]
 
@@ -72,12 +73,16 @@ def _make_fake_server(tmp_path):
             if scenario == "bad-startup":
                 send({"jsonrpc": "2.0", "id": 4, "result": None})
                 sys.exit(0)
+            if scenario == "hang-startup":
+                time.sleep(60)
 
             send({"jsonrpc": "2.0", "method": "boot-note", "params": [1]})
             send({"jsonrpc": "2.0", "method": "ready_seq"})
             request = receive()
 
-            if scenario == "normal":
+            if scenario == "hang-request":
+                time.sleep(60)
+            elif scenario == "normal":
                 send({"jsonrpc": "2.0", "method": "progress", "params": {"step": 1}})
                 send({"jsonrpc": "2.0", "id": request["id"], "result": {"ok": "😊"}})
             elif scenario == "recoverable":
@@ -230,6 +235,22 @@ def test_startup_failures_capture_shape_and_stderr(tmp_path):
         rdm_backend.JsonRpcProcess((sys.executable, server, "exit-startup"))
     assert exc_info.value.returncode == 17
     assert "startup exploded" in exc_info.value.stderr_tail
+
+
+def test_startup_and_request_deadlines_reap_process(tmp_path):
+    server = _make_fake_server(tmp_path)
+    with pytest.raises(rdm_backend.JsonRpcDeadlineExceeded):
+        rdm_backend.JsonRpcProcess(
+            (sys.executable, server, "hang-startup"), request_timeout=0.05
+        )
+    process = rdm_backend.JsonRpcProcess(
+        (sys.executable, server, "hang-request"), request_timeout=0.05
+    )
+    with pytest.raises(rdm_backend.JsonRpcDeadlineExceeded):
+        process.request("ping", [])
+    child = process._process
+    process.close()
+    assert child.poll() is not None
 
 
 def test_close_is_idempotent(tmp_path):
@@ -445,7 +466,7 @@ class FakeCompilerEvaluator(object):
     def materialize_context(self, spec):
         return spec
 
-    def begin(self, context, source):
+    def begin(self, context, source, target_policy=None):
         self.begun.append((context, source))
         if self.begin_error is not None:
             raise self.begin_error
@@ -475,6 +496,9 @@ class FakeDocumentEvaluator(object):
         self.finished = []
         self.closed = False
         self.reset_count = 0
+        self.disabled = []
+        self.advanced = []
+        self.accepted_source = "accepted"
 
     def unsupported_reason(self, context):
         return self.reason
@@ -489,6 +513,12 @@ class FakeDocumentEvaluator(object):
         self.finished.append((trial, accepted))
         if self.finish_error is not None:
             raise self.finish_error
+
+    def disable(self, context, reason):
+        self.disabled.append((context, reason))
+
+    def advance_accepted_source(self, source):
+        self.advanced.append(source)
 
     def reset(self):
         self.reset_count += 1
@@ -586,6 +616,127 @@ def test_compiler_infrastructure_failure_discards_live_shadow_trial():
     assert document.finished[0][1] is False
 
 
+def _hybrid(compiler, document, logs, check_rejected_every=0):
+    hybrid = object.__new__(rdm_backend.RdmHybridEvaluator)
+    hybrid.compiler_evaluator = compiler
+    hybrid.document_evaluator = document
+    hybrid.target_policy = LegacyTargetPolicy(False, "TARGET")
+    hybrid._log = lambda message, **kwargs: logs.append(message)
+    hybrid._check_rejected_every = check_rejected_every
+    hybrid._reject_counts = {}
+
+    class Confirmed(dict):
+        def get(self, key, default=None):
+            return document.accepted_source
+
+    hybrid._baseline_confirmed = Confirmed()
+    hybrid._closed = False
+    return hybrid
+
+
+def test_hybrid_reference_baseline_is_compiler_confirmed_before_fast_reject():
+    baseline = Evaluation(
+        EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1
+    )
+    compiler = FakeCompilerEvaluator(baseline)
+    document = FakeDocumentEvaluator(_document_observation("success", ""))
+    hybrid = _hybrid(compiler, document, [])
+    hybrid._baseline_confirmed = {}
+    Context = namedtuple("Context", "role")
+    context = Context("primary")
+    policy = LegacyTargetPolicy(False, "TARGET")
+    trial = hybrid.begin(context, "candidate", policy)
+    assert compiler.begun == [(context, "accepted")]
+    assert trial.token.route == "fast_reject"
+    hybrid.finish(trial, False)
+
+
+def test_hybrid_fast_reject_skips_compiler_and_cannot_authorize_acceptance():
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)
+    )
+    document = FakeDocumentEvaluator(_document_observation("success", ""))
+    hybrid = _hybrid(compiler, document, [])
+    Context = namedtuple("Context", "role")
+    context = Context("primary")
+    policy = LegacyTargetPolicy(False, "TARGET")
+    trial = hybrid.begin(context, "candidate", policy)
+    assert trial.token.route == "fast_reject"
+    assert not compiler.begun
+    assert not hybrid.acceptance_authorized(trial, policy, "primary")
+    hybrid.finish(trial, False)
+    assert document.finished[0][1] is False
+
+
+def test_hybrid_document_positive_requires_compiler_confirmation():
+    compiler_evaluation = Evaluation(
+        EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1
+    )
+    compiler = FakeCompilerEvaluator(compiler_evaluation)
+    document = FakeDocumentEvaluator(
+        _document_observation("command_error", "Error: TARGET")
+    )
+    hybrid = _hybrid(compiler, document, [])
+    Context = namedtuple("Context", "role")
+    policy = LegacyTargetPolicy(False, "TARGET")
+    trial = hybrid.begin(Context("primary"), "candidate", policy)
+    assert trial.token.route == "reference_confirm"
+    assert compiler.begun
+    assert hybrid.acceptance_authorized(trial, policy, "primary")
+    hybrid.finish(trial, True)
+    assert compiler.finished == [("compiler", True)]
+    assert document.finished[0][1] is True
+
+
+def test_hybrid_compiler_fallback_acceptance_advances_raw_source():
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)
+    )
+    document = FakeDocumentEvaluator(reason="unsupported context")
+    hybrid = _hybrid(compiler, document, [])
+    Context = namedtuple("Context", "role")
+    policy = LegacyTargetPolicy(False, "TARGET")
+    trial = hybrid.begin(Context("primary"), "new raw", policy)
+    assert trial.token.route == "compiler_fallback"
+    assert hybrid.acceptance_authorized(trial, policy, "primary")
+    hybrid.finish(trial, True)
+    assert document.advanced == ["new raw"]
+
+
+def test_hybrid_passing_requires_strict_compiler_success():
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.SUCCESS, "", (), 0)
+    )
+    document = FakeDocumentEvaluator(_document_observation("success", ""))
+    hybrid = _hybrid(compiler, document, [])
+    Context = namedtuple("Context", "role")
+    policy = LegacyTargetPolicy(False, "TARGET")
+    trial = hybrid.begin(Context("passing"), "candidate", policy)
+    assert trial.token.document_verdict is True
+    assert trial.token.compiler_verdict is True
+    assert hybrid.acceptance_authorized(trial, policy, "passing")
+    hybrid.finish(trial, True)
+
+
+def test_hybrid_audit_detects_false_negative_and_disables_context():
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)
+    )
+    document = FakeDocumentEvaluator(_document_observation("success", ""))
+    logs = []
+    hybrid = _hybrid(compiler, document, logs, check_rejected_every=1)
+    Context = namedtuple("Context", "role")
+    context = Context("primary")
+    policy = LegacyTargetPolicy(False, "TARGET")
+    trial = hybrid.begin(context, "candidate", policy)
+    assert trial.token.route == "audited_reject"
+    assert trial.token.reason == "document-false-negative"
+    assert document.disabled
+    assert hybrid.acceptance_authorized(trial, policy, "primary")
+    hybrid.finish(trial, True)
+    assert document.finished[0][1] is False
+
+
 def test_session_pool_restarts_once_from_accepted_source_after_process_failure(
     monkeypatch,
 ):
@@ -605,6 +756,7 @@ def test_session_pool_restarts_once_from_accepted_source_after_process_failure(
             generation=1,
             client_factory=None,
             log=None,
+            request_timeout=rdm_backend.DEFAULT_REQUEST_TIMEOUT,
         ):
             self.context = context
             self.accepted_source = accepted_source
@@ -651,6 +803,60 @@ def test_session_pool_restarts_once_from_accepted_source_after_process_failure(
     assert pool.restart_count == 1
     pool.finish(trial, False)
     pool.close()
+
+
+def test_ten_thousand_trials_keep_one_live_session_with_restart_cap(monkeypatch):
+    created = []
+    baseline = _document_observation(
+        "command_error", "Error: TARGET"
+    )
+
+    class Session(object):
+        def __init__(
+            self,
+            manager_command,
+            context,
+            accepted_source,
+            generation=1,
+            client_factory=None,
+            log=None,
+            request_timeout=rdm_backend.DEFAULT_REQUEST_TIMEOUT,
+        ):
+            self.context = context
+            self.accepted_source = accepted_source
+            self.generation = generation
+            self.canonical_observation = baseline
+            self.active_trial_count = 0
+            created.append(self)
+
+        def begin(self, source):
+            self.active_trial_count = 1
+            return rdm_backend.RdmSessionTrial(
+                self, self.generation, 1, source, baseline, True
+            )
+
+        def finish(self, trial, accepted):
+            self.active_trial_count = 0
+
+        def close(self):
+            self.active_trial_count = 0
+
+    monkeypatch.setattr(rdm_backend, "RdmSession", Session)
+    Context = namedtuple("Context", "role")
+    pool = rdm_backend.RdmSessionPool(
+        ("manager",),
+        "accepted",
+        LegacyTargetPolicy(False, "TARGET"),
+        restart_every=17,
+    )
+    for _ in range(10000):
+        trial = pool.begin(Context("primary"), "candidate")
+        pool.finish(trial, False)
+        assert pool.session_count == 1
+    assert pool.restart_count == 588
+    assert len(created) == 589
+    pool.close()
+    assert pool.session_count == 0
 
 
 def test_real_document_session_promotes_raw_source_and_discards_rejection(tmp_path):

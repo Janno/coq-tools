@@ -10,7 +10,9 @@ import hashlib
 import json
 import os
 import re
+import selectors
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -27,6 +29,12 @@ from .candidate_evaluator import (
 
 
 DEFAULT_MAX_FRAME_SIZE = 64 * 1024 * 1024
+DEFAULT_REQUEST_TIMEOUT = 30.0
+DEFAULT_HYBRID_RESTART_EVERY = 500
+PROCESS_TERM_GRACE = 0.5
+TRUSTED_MANAGER_SHA256 = frozenset(
+    ("8ef1e2e9a4637b48375ebf5ffabfe72a07df4e3511df794d9b4a5a605777b2c7",)
+)
 
 
 class RdmError(Exception):
@@ -51,6 +59,20 @@ class JsonRpcFramingError(JsonRpcError):
 
 class JsonRpcProtocolError(JsonRpcError):
     """A frame contained invalid JSON-RPC data."""
+
+
+class JsonRpcDeadlineExceeded(JsonRpcError):
+    """A startup or request exceeded its absolute wall-clock deadline."""
+
+    def __init__(self, phase, timeout, method=None, stderr_tail=""):
+        message = "JSON-RPC %s exceeded %.3f seconds" % (phase, timeout)
+        if method is not None:
+            message += " while calling %s" % method
+        super(JsonRpcDeadlineExceeded, self).__init__(message)
+        self.phase = phase
+        self.timeout = timeout
+        self.method = method
+        self.stderr_tail = stderr_tail
 
 
 class JsonRpcProcessError(JsonRpcError):
@@ -112,6 +134,13 @@ RdmSessionTrial = namedtuple(
 ShadowTrialToken = namedtuple(
     "ShadowTrialToken",
     "compiler_trial document_trial document_observation unsupported_reason",
+)
+HybridTrialToken = namedtuple(
+    "HybridTrialToken",
+    (
+        "route source context role policy_identity compiler_trial document_trial "
+        "document_observation document_verdict compiler_verdict reason audited"
+    ),
 )
 
 REQUIRED_METHODS = frozenset(
@@ -336,16 +365,23 @@ class JsonRpcProcess(object):
         environment=None,
         max_frame_size=DEFAULT_MAX_FRAME_SIZE,
         startup_method="ready_seq",
+        request_timeout=DEFAULT_REQUEST_TIMEOUT,
     ):
         self.command = tuple(command)
         self.cwd = cwd
         self._environment = None if environment is None else dict(environment)
         self._max_frame_size = max_frame_size
+        self._request_timeout = float(request_timeout)
+        if self._request_timeout <= 0:
+            raise ValueError("request_timeout must be positive")
         self._process = None
+        self._process_group = None
+        self._read_buffer = bytearray()
         self._stderr = tempfile.TemporaryFile(mode="w+b")
         self._notifications = []
         self._next_id = 0
         self._in_request = False
+        self._absolute_deadline = None
         self._usable = True
         self._closed = False
         self.returncode = None
@@ -357,7 +393,10 @@ class JsonRpcProcess(object):
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=self._stderr,
+                start_new_session=(os.name == "posix"),
             )
+            if os.name == "posix":
+                self._process_group = self._process.pid
             self._wait_for_startup(startup_method)
         except BaseException:
             self._cleanup_after_startup_failure()
@@ -390,16 +429,84 @@ class JsonRpcProcess(object):
             self.returncode = code
         return code
 
-    def _receive(self):
+    def _read_until(self, marker, deadline, phase, method=None):
         if self._process is None or self._process.stdout is None:
             raise JsonRpcError("JSON-RPC process is not running")
+        descriptor = self._process.stdout.fileno()
+        with selectors.DefaultSelector() as selector:
+            selector.register(descriptor, selectors.EVENT_READ)
+            while marker not in self._read_buffer:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise JsonRpcDeadlineExceeded(
+                        phase,
+                        self._request_timeout,
+                        method=method,
+                        stderr_tail=self._stderr_tail(),
+                    )
+                chunk = os.read(descriptor, 65536)
+                if not chunk:
+                    raise JsonRpcFramingError("Unexpected EOF while reading frame")
+                self._read_buffer.extend(chunk)
+
+    def _read_exact_buffered(self, length, deadline, phase, method=None):
+        if self._process is None or self._process.stdout is None:
+            raise JsonRpcError("JSON-RPC process is not running")
+        descriptor = self._process.stdout.fileno()
+        with selectors.DefaultSelector() as selector:
+            selector.register(descriptor, selectors.EVENT_READ)
+            while len(self._read_buffer) < length:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise JsonRpcDeadlineExceeded(
+                        phase,
+                        self._request_timeout,
+                        method=method,
+                        stderr_tail=self._stderr_tail(),
+                    )
+                chunk = os.read(descriptor, max(65536, length - len(self._read_buffer)))
+                if not chunk:
+                    raise JsonRpcFramingError("Unexpected EOF while reading frame")
+                self._read_buffer.extend(chunk)
+        value = bytes(self._read_buffer[:length])
+        del self._read_buffer[:length]
+        return value
+
+    def _receive(self, deadline=None, phase="request", method=None):
+        if deadline is None:
+            deadline = time.monotonic() + self._request_timeout
         try:
-            return _validate_packet(
-                read_json_rpc_frame(
-                    self._process.stdout, max_frame_size=self._max_frame_size
-                )
+            self._read_until(b"\r\n\r\n", deadline, phase, method)
+            end = self._read_buffer.index(b"\r\n\r\n")
+            header = bytes(self._read_buffer[:end])
+            del self._read_buffer[: end + 4]
+            lines = header.split(b"\r\n")
+            lengths = []
+            for line in lines:
+                if b":" not in line:
+                    raise JsonRpcFramingError("Malformed JSON-RPC header")
+                key, value = line.split(b":", 1)
+                if key.strip().lower() == b"content-length":
+                    try:
+                        lengths.append(int(value.strip()))
+                    except ValueError:
+                        raise JsonRpcFramingError("Invalid Content-Length")
+            if len(lengths) != 1 or lengths[0] < 0:
+                raise JsonRpcFramingError("Expected one Content-Length header")
+            if lengths[0] > self._max_frame_size:
+                raise JsonRpcFramingError("JSON-RPC payload is too large")
+            payload = self._read_exact_buffered(
+                lengths[0], deadline, phase, method
             )
-        except JsonRpcFramingError as exc:
+            try:
+                packet = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise JsonRpcProtocolError("Invalid JSON-RPC payload: %s" % exc)
+            return _validate_packet(packet)
+        except JsonRpcProtocolError:
+            self._usable = False
+            raise
+        except (JsonRpcFramingError, JsonRpcDeadlineExceeded):
             code = self._poll_after_eof()
             self._usable = False
             if code is not None:
@@ -411,8 +518,9 @@ class JsonRpcProcess(object):
             raise
 
     def _wait_for_startup(self, startup_method):
+        deadline = time.monotonic() + self._request_timeout
         while True:
-            packet = self._receive()
+            packet = self._receive(deadline, "startup")
             if "id" in packet or "result" in packet or "error" in packet:
                 self._usable = False
                 raise JsonRpcProtocolError(
@@ -458,7 +566,10 @@ class JsonRpcProcess(object):
                 stderr_tail=self._stderr_tail(),
             )
 
-    def request(self, method, params):
+    def set_deadline(self, deadline):
+        self._absolute_deadline = deadline
+
+    def request(self, method, params, timeout=None):
         self._ensure_usable()
         if self._in_request:
             raise JsonRpcProtocolError("Concurrent or reentrant request is unsupported")
@@ -466,6 +577,12 @@ class JsonRpcProcess(object):
             raise TypeError("JSON-RPC method must be text and params must be a sequence")
         request_id = self._next_id
         self._next_id += 1
+        request_timeout = self._request_timeout if timeout is None else float(timeout)
+        if request_timeout <= 0:
+            raise ValueError("request timeout must be positive")
+        deadline = time.monotonic() + request_timeout
+        if self._absolute_deadline is not None:
+            deadline = min(deadline, self._absolute_deadline)
         self._in_request = True
         try:
             self._send(
@@ -477,7 +594,7 @@ class JsonRpcProcess(object):
                 }
             )
             while True:
-                packet = self._receive()
+                packet = self._receive(deadline, "request", method)
                 if "method" in packet and "id" not in packet:
                     notification_method = packet.get("method")
                     if not isinstance(notification_method, str):
@@ -534,18 +651,38 @@ class JsonRpcProcess(object):
         finally:
             self._in_request = False
 
+    def _terminate_process_group(self):
+        process = self._process
+        if process is None:
+            return
+        try:
+            if self._process_group is not None and os.name == "posix":
+                # Signal the group even if the direct child already exited;
+                # splitter descendants may still be alive.
+                os.killpg(self._process_group, signal.SIGTERM)
+            elif process.poll() is None:
+                process.terminate()
+            if process.poll() is None:
+                process.wait(timeout=PROCESS_TERM_GRACE)
+            elif self._process_group is None:
+                return
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        try:
+            if self._process_group is not None and os.name == "posix":
+                os.killpg(self._process_group, signal.SIGKILL)
+            elif process.poll() is None:
+                process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=PROCESS_TERM_GRACE)
+        except BaseException:
+            pass
+
     def _cleanup_after_startup_failure(self):
         process = self._process
-        if process is not None and process.poll() is None:
-            try:
-                process.terminate()
-                process.wait(timeout=0.5)
-            except BaseException:
-                try:
-                    process.kill()
-                    process.wait(timeout=0.5)
-                except BaseException:
-                    pass
+        self._terminate_process_group()
         if process is not None:
             self.returncode = process.poll()
             for stream in (process.stdin, process.stdout):
@@ -572,14 +709,15 @@ class JsonRpcProcess(object):
                 process.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
                 try:
-                    process.terminate()
-                    process.wait(timeout=0.5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=0.5)
+                    self._terminate_process_group()
                 except BaseException as exc:
                     if first_error is None:
                         first_error = exc
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+            try:
+                self._terminate_process_group()
             except BaseException as exc:
                 if first_error is None:
                     first_error = exc
@@ -711,6 +849,11 @@ class RdmClient(object):
             [_require_int(cursor, "cursor"), _require_text(text, "text")],
         )
         return _validate_items(result, prefix=False, sentence=True)
+
+    def set_deadline(self, deadline):
+        setter = getattr(self.transport, "set_deadline", None)
+        if setter is not None:
+            setter(deadline)
 
     def close(self):
         return self.transport.close()
@@ -880,9 +1023,16 @@ def _select_command_message(parsed_error):
     return message, location, command_error.feedback_messages
 
 
-def _default_client_factory(command, cwd, environment):
+def _default_client_factory(
+    command, cwd, environment, request_timeout=DEFAULT_REQUEST_TIMEOUT
+):
     return RdmClient(
-        JsonRpcProcess(command, cwd=cwd, environment=environment)
+        JsonRpcProcess(
+            command,
+            cwd=cwd,
+            environment=environment,
+            request_timeout=request_timeout,
+        )
     )
 
 
@@ -897,12 +1047,14 @@ class RdmSession(object):
         generation=1,
         client_factory=None,
         log=None,
+        request_timeout=DEFAULT_REQUEST_TIMEOUT,
     ):
         self.manager_command = tuple(manager_command)
         self.context = context
         self.accepted_source = accepted_source
         self.generation = generation
         self._client_factory = client_factory or _default_client_factory
+        self._request_timeout = float(request_timeout)
         self._log = log or (lambda *args, **kwargs: None)
         self.client = None
         self.canonical_cursor = None
@@ -940,25 +1092,37 @@ class RdmSession(object):
         command = list(self.manager_command) + [self._private_file]
         if self.context.arguments:
             command += ["--"] + list(self.context.arguments)
-        self.client = self._client_factory(
-            tuple(command),
-            self.context.cwd,
-            self.context.environment.as_dict(),
-        )
         try:
-            self.client.load_file(0)
-        except JsonRpcRequestError as exc:
-            raise RdmUnsupported(
-                "Accepted baseline could not be loaded: %s" % exc
+            self.client = self._client_factory(
+                tuple(command),
+                self.context.cwd,
+                self.context.environment.as_dict(),
+                self._request_timeout,
             )
-        if self.client.contents(0, False, True) != self.accepted_source:
-            raise RdmUnsupported(
-                "Loaded document does not match accepted raw source"
+        except TypeError:
+            self.client = self._client_factory(
+                tuple(command),
+                self.context.cwd,
+                self.context.environment.as_dict(),
             )
-        self.canonical_cursor = 0
-        self.canonical_observation = self._run_cursor(
-            0, self.accepted_source, replay_item=0, split_runtime=0.0
-        )
+        self.client.set_deadline(time.monotonic() + self._request_timeout)
+        try:
+            try:
+                self.client.load_file(0)
+            except JsonRpcRequestError as exc:
+                raise RdmUnsupported(
+                    "Accepted baseline could not be loaded: %s" % exc
+                )
+            if self.client.contents(0, False, True) != self.accepted_source:
+                raise RdmUnsupported(
+                    "Loaded document does not match accepted raw source"
+                )
+            self.canonical_cursor = 0
+            self.canonical_observation = self._run_cursor(
+                0, self.accepted_source, replay_item=0, split_runtime=0.0
+            )
+        finally:
+            self.client.set_deadline(None)
 
     @property
     def private_file(self):
@@ -1042,8 +1206,10 @@ class RdmSession(object):
     def begin(self, source):
         if self._closed:
             raise RdmUnavailable("Document session is closed")
-        cursor = self.client.clone(self.canonical_cursor)
+        self.client.set_deadline(time.monotonic() + self._request_timeout)
+        cursor = None
         try:
+            cursor = self.client.clone(self.canonical_cursor)
             items = self._canonical_items()
             replay_item, source_offset = find_item_boundary(
                 items, self.accepted_source, source
@@ -1115,11 +1281,14 @@ class RdmSession(object):
             self._active[cursor] = trial
             return trial
         except BaseException:
-            try:
-                self.client.dispose(cursor)
-            except BaseException:
-                pass
+            if cursor is not None:
+                try:
+                    self.client.dispose(cursor)
+                except BaseException:
+                    pass
             raise
+        finally:
+            self.client.set_deadline(None)
 
     def finish(self, trial, accepted):
         if trial.session is not self or trial.generation != self.generation:
@@ -1192,6 +1361,7 @@ class RdmSessionPool(object):
         restart_every=0,
         client_factory=None,
         log=None,
+        request_timeout=DEFAULT_REQUEST_TIMEOUT,
     ):
         self.primary_manager = tuple(primary_manager)
         self.passing_manager = tuple(passing_manager or primary_manager)
@@ -1201,6 +1371,7 @@ class RdmSessionPool(object):
         if self.restart_every < 0:
             raise ValueError("restart_every must not be negative")
         self._client_factory = client_factory
+        self._request_timeout = float(request_timeout)
         self._log = log or (lambda *args, **kwargs: None)
         self._sessions = {}
         self._generation = 0
@@ -1234,6 +1405,7 @@ class RdmSessionPool(object):
             generation=self._generation,
             client_factory=self._client_factory,
             log=self._log,
+            request_timeout=self._request_timeout,
         )
         if not self._baseline_healthy(context, session.canonical_observation):
             try:
@@ -1255,6 +1427,15 @@ class RdmSessionPool(object):
     def _session(self, context):
         if self._closed:
             raise RdmUnavailable("Document session pool is closed")
+        # Keep one live context per role.  Context exploration (notably
+        # argument minimization) must not accumulate manager processes.
+        for other_context, other_session in tuple(self._sessions.items()):
+            if other_context != context and other_context.role == context.role:
+                if other_session.active_trial_count:
+                    raise RdmUnavailable(
+                        "Another document context for this role has an active trial"
+                    )
+                self._drop(other_context)
         session = self._sessions.get(context)
         if session is not None and session.accepted_source != self.accepted_source:
             if session.active_trial_count:
@@ -1288,6 +1469,13 @@ class RdmSessionPool(object):
             session = self._new_session(context)
             self._attempts[context] = 1
             return session.begin(source)
+
+    def advance_accepted_source(self, source):
+        """Record a compiler-confirmed acceptance without a document trial."""
+        self.accepted_source = source
+        for context, session in tuple(self._sessions.items()):
+            if not session.active_trial_count:
+                self._drop(context)
 
     def finish(self, trial, accepted):
         context = trial.session.context
@@ -1343,7 +1531,7 @@ def _observation_as_evaluation(observation):
 
 
 class RdmEvaluator(object):
-    """Stateful document engine used observationally by the shadow adapter."""
+    """Stateful document engine used by shadow and hybrid adapters."""
 
     def __init__(
         self,
@@ -1356,6 +1544,8 @@ class RdmEvaluator(object):
         environment=None,
         client_factory=None,
         log=None,
+        request_timeout=DEFAULT_REQUEST_TIMEOUT,
+        require_trusted=False,
     ):
         self.primary_manager = tuple(primary_manager)
         self.passing_manager = tuple(passing_manager or primary_manager)
@@ -1363,11 +1553,15 @@ class RdmEvaluator(object):
         self._log = log or (lambda *args, **kwargs: None)
         self._client_factory = client_factory
         self._restart_every = restart_every
+        self._request_timeout = float(request_timeout)
+        self._require_trusted = bool(require_trusted)
         self._disabled = {}
+        self._compiler_versions = {}
         self._closed = False
         self.primary_probe = None
         self.passing_probe = None
         self.probe_errors = ()
+        self._context_probes = {}
         errors = []
         try:
             self.primary_probe = probe_rdm(
@@ -1393,6 +1587,7 @@ class RdmEvaluator(object):
             restart_every=restart_every,
             client_factory=client_factory,
             log=self._log,
+            request_timeout=self._request_timeout,
         )
 
     @property
@@ -1414,7 +1609,49 @@ class RdmEvaluator(object):
         return self.pool.accepted_source
 
     def _probe_for(self, context):
-        return self.passing_probe if context.role == "passing" else self.primary_probe
+        probe = self._context_probes.get(context)
+        if probe is not None:
+            return probe
+        manager = (
+            self.passing_manager
+            if context.role == "passing"
+            else self.primary_manager
+        )
+        try:
+            probe = probe_rdm(
+                manager,
+                cwd=context.cwd,
+                environment=context.environment.as_dict(),
+                timeout=min(self._request_timeout, 10.0),
+            )
+        except RdmError as exc:
+            self._disabled[context] = "capability-probe-failed: %s" % exc
+            return None
+        self._context_probes[context] = probe
+        return probe
+
+    def _compiler_version(self, context):
+        key = (context.executable_identity, context.cwd, context.environment.digest)
+        if key not in self._compiler_versions:
+            try:
+                completed = subprocess.run(
+                    list(context.executable) + ["--version"],
+                    cwd=context.cwd,
+                    env=context.environment.as_dict(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=min(self._request_timeout, 10.0),
+                )
+                text = completed.stdout.decode("utf-8", "replace")
+                match = re.search(r"(?:version\s+)?([0-9]+\.[0-9]+)", text)
+                self._compiler_versions[key] = (
+                    match.group(1)
+                    if completed.returncode == 0 and match is not None
+                    else None
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                self._compiler_versions[key] = None
+        return self._compiler_versions[key]
 
     def unsupported_reason(self, context):
         if self._closed:
@@ -1425,7 +1662,13 @@ class RdmEvaluator(object):
         if probe is None:
             return "document-manager capability probe failed"
         if probe.missing_methods:
-            return "missing RPC methods: %s" % ", ".join(probe.missing_methods)
+            return "missing-capability: %s" % ", ".join(probe.missing_methods)
+        if self._require_trusted and probe.sha256 not in TRUSTED_MANAGER_SHA256:
+            return "untrusted-manager-build: %s" % probe.sha256
+        if self._require_trusted and os.name != "posix":
+            return "unsupported-platform: process-group supervision unavailable"
+        if self._require_trusted and self._compiler_version(context) != "9.2":
+            return "toolchain-mismatch: trusted manager requires Rocq 9.2"
         if context.checker_executable is not None:
             return "coqchk/checker contexts are compiler-only"
         if context.is_toplevel or context.pass_on_stdin:
@@ -1444,6 +1687,15 @@ class RdmEvaluator(object):
             return "memory-limited candidates require the fresh compiler oracle"
         return None
 
+    def disable(self, context, reason):
+        self._disabled[context] = str(reason)
+        session = self.pool._sessions.get(context)
+        if session is not None and not session.active_trial_count:
+            try:
+                self.pool._drop(context)
+            except BaseException:
+                pass
+
     def begin(self, context, source):
         reason = self.unsupported_reason(context)
         if reason is not None:
@@ -1458,12 +1710,17 @@ class RdmEvaluator(object):
     def finish(self, trial, accepted):
         return self.pool.finish(trial, accepted)
 
+    def advance_accepted_source(self, source):
+        return self.pool.advance_accepted_source(source)
+
     def reset(self):
         if self._closed:
             raise RdmUnavailable("Document evaluator is closed")
         accepted_source = self.pool.accepted_source
         self.pool.close()
         self._disabled.clear()
+        self._compiler_versions.clear()
+        self._context_probes.clear()
         self.pool = RdmSessionPool(
             self.primary_manager,
             accepted_source,
@@ -1472,6 +1729,7 @@ class RdmEvaluator(object):
             restart_every=self._restart_every,
             client_factory=self._client_factory,
             log=self._log,
+            request_timeout=self._request_timeout,
         )
 
     def close(self):
@@ -1496,6 +1754,7 @@ class RdmShadowEvaluator(CandidateEvaluator):
         environment=None,
         client_factory=None,
         log=None,
+        request_timeout=DEFAULT_REQUEST_TIMEOUT,
     ):
         if not isinstance(compiler_evaluator, CoqcEvaluator):
             # Tests may supply a compatible fake, so require behavior rather
@@ -1515,6 +1774,7 @@ class RdmShadowEvaluator(CandidateEvaluator):
             environment=environment,
             client_factory=client_factory,
             log=self._log,
+            request_timeout=request_timeout,
         )
         self._closed = False
 
@@ -1562,7 +1822,7 @@ class RdmShadowEvaluator(CandidateEvaluator):
             ("generation", observation.generation),
         )
 
-    def begin(self, context, source):
+    def begin(self, context, source, target_policy=None):
         if self._closed:
             raise CandidateLifecycleError("Shadow evaluator is closed")
         document_trial = None
@@ -1580,7 +1840,9 @@ class RdmShadowEvaluator(CandidateEvaluator):
                 )
         compiler_trial = None
         try:
-            compiler_trial = self.compiler_evaluator.begin(context, source)
+            compiler_trial = self.compiler_evaluator.begin(
+                context, source, target_policy
+            )
         except BaseException:
             if document_trial is not None:
                 try:
@@ -1715,6 +1977,422 @@ class RdmShadowEvaluator(CandidateEvaluator):
             self.document_evaluator.reset()
         except BaseException as exc:
             self._log("rdm-shadow reset failed: %s" % exc, level=1)
+
+    def close(self):
+        if self._closed:
+            return
+        first_error = None
+        try:
+            self.document_evaluator.close()
+        except BaseException as exc:
+            first_error = exc
+        try:
+            self.compiler_evaluator.close()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+        self._closed = True
+        if first_error is not None:
+            raise first_error
+
+
+class RdmHybridEvaluator(CandidateEvaluator):
+    """Use the document manager only as a rejection oracle.
+
+    A live compiler trial is required before ``acceptance_authorized`` can
+    succeed.  Document infrastructure failures fail open to the compiler;
+    document verdicts can only avoid a compiler run for a rejected candidate.
+    """
+
+    def __init__(
+        self,
+        compiler_evaluator,
+        primary_manager,
+        accepted_source,
+        target_policy,
+        passing_manager=None,
+        restart_every=DEFAULT_HYBRID_RESTART_EVERY,
+        request_timeout=DEFAULT_REQUEST_TIMEOUT,
+        check_rejected_every=0,
+        cwd=None,
+        environment=None,
+        client_factory=None,
+        log=None,
+        require_trusted=True,
+    ):
+        for name in (
+            "materialize_context",
+            "begin",
+            "finish",
+            "reset_calibration",
+            "close",
+        ):
+            if not hasattr(compiler_evaluator, name):
+                raise TypeError("compiler evaluator lacks %s" % name)
+        self.compiler_evaluator = compiler_evaluator
+        self.target_policy = target_policy
+        self._log = log or (lambda *args, **kwargs: None)
+        self._check_rejected_every = int(check_rejected_every)
+        if self._check_rejected_every < 0:
+            raise ValueError("check_rejected_every must not be negative")
+        self._reject_counts = {}
+        self._baseline_confirmed = {}
+        self.document_evaluator = RdmEvaluator(
+            primary_manager,
+            accepted_source,
+            target_policy,
+            passing_manager=passing_manager,
+            restart_every=restart_every,
+            cwd=cwd,
+            environment=environment,
+            client_factory=client_factory,
+            log=self._log,
+            request_timeout=request_timeout,
+            require_trusted=require_trusted,
+        )
+        self._closed = False
+
+    @property
+    def identity(self):
+        return (
+            "rdm-hybrid-evaluator",
+            1,
+            self.compiler_evaluator.identity,
+            self.document_evaluator.identity,
+            self.target_policy.identity,
+            self._check_rejected_every,
+        )
+
+    @property
+    def requires_materialization_for_accept(self):
+        return True
+
+    @property
+    def invalidates_cache_after_accept(self):
+        return True
+
+    def materialize_context(self, spec):
+        if self._closed:
+            raise CandidateLifecycleError("Hybrid evaluator is closed")
+        return self.compiler_evaluator.materialize_context(spec)
+
+    @staticmethod
+    def _predicate(policy, role, evaluation):
+        if role == "passing":
+            return policy.passing_succeeds(evaluation)
+        return policy.primary_preserves(evaluation)
+
+    def _audit_rejection(self, context):
+        count = self._reject_counts.get(context, 0) + 1
+        self._reject_counts[context] = count
+        return (
+            self._check_rejected_every > 0
+            and count % self._check_rejected_every == 0
+        )
+
+    def _ensure_reference_baseline(self, context, policy):
+        accepted_source = self.document_evaluator.accepted_source
+        if self._baseline_confirmed.get(context) == accepted_source:
+            return None
+        trial = self.compiler_evaluator.begin(context, accepted_source, policy)
+        try:
+            healthy = self._predicate(policy, context.role, trial.evaluation)
+        finally:
+            self.compiler_evaluator.finish(trial, False)
+        if not healthy:
+            reason = "reference-baseline-mismatch"
+            self.document_evaluator.disable(context, reason)
+            return reason
+        self._baseline_confirmed[context] = accepted_source
+        return None
+
+    @staticmethod
+    def _details(
+        route,
+        document_observation,
+        document_verdict,
+        compiler_evaluation,
+        compiler_verdict,
+        reason,
+        audited,
+        document_identity,
+    ):
+        return (
+            ("route", route),
+            ("document", RdmShadowEvaluator._shadow_details(
+                document_observation, reason, document_identity
+            )),
+            ("document_verdict", document_verdict),
+            ("compiler_ran", compiler_evaluation is not None),
+            ("compiler_verdict", compiler_verdict),
+            ("audited", audited),
+            ("fallback_reason", reason),
+        )
+
+    @staticmethod
+    def _copy_with_details(evaluation, details):
+        return Evaluation(
+            evaluation.status,
+            evaluation.output,
+            evaluation.commands,
+            evaluation.returncode,
+            evaluation.runtime,
+            evaluation.peak_rss_kb,
+            evaluation.diagnostics,
+            tuple(evaluation.details) + (("rdm_hybrid", details),),
+        )
+
+    def begin(self, context, source, target_policy=None):
+        if self._closed:
+            raise CandidateLifecycleError("Hybrid evaluator is closed")
+        policy = target_policy or self.target_policy
+        if policy.identity != self.target_policy.identity:
+            raise RdmUnsupported("target-policy-mismatch")
+
+        document_trial = None
+        document_observation = None
+        document_verdict = None
+        compiler_trial = None
+        compiler_evaluation = None
+        compiler_verdict = None
+        reason = self.document_evaluator.unsupported_reason(context)
+        if reason is None:
+            try:
+                reason = self._ensure_reference_baseline(context, policy)
+            except BaseException as exc:
+                reason = "reference-baseline-unavailable: %s" % exc
+                self.document_evaluator.disable(context, reason)
+        if reason is None:
+            try:
+                document_trial = self.document_evaluator.begin(context, source)
+                document_observation = document_trial.observation
+                if document_observation.status == EvaluationStatus.PARSE_ERROR:
+                    reason = "parser-target-is-compiler-only"
+                    self.document_evaluator.finish(document_trial, False)
+                    document_trial = None
+                    document_verdict = None
+                else:
+                    document_verdict = self._predicate(
+                        policy,
+                        context.role,
+                        _observation_as_evaluation(document_observation),
+                    )
+            except (RdmError, OSError, EOFError) as exc:
+                reason = "%s: %s" % (type(exc).__name__, exc)
+                document_trial = None
+                document_observation = None
+                self._log("rdm-hybrid compiler fallback: %s" % reason, level=1)
+
+        audited = False
+        if document_verdict is False:
+            audited = self._audit_rejection(context)
+            if not audited:
+                document_evaluation = _observation_as_evaluation(
+                    document_observation
+                )
+                details = self._details(
+                    "fast_reject",
+                    document_observation,
+                    False,
+                    None,
+                    None,
+                    reason,
+                    False,
+                    self.document_evaluator.identity,
+                )
+                return EvaluationTrial(
+                    self._copy_with_details(document_evaluation, details),
+                    HybridTrialToken(
+                        "fast_reject",
+                        source,
+                        context,
+                        context.role,
+                        policy.identity,
+                        None,
+                        document_trial,
+                        document_observation,
+                        False,
+                        None,
+                        reason,
+                        False,
+                    ),
+                    False,
+                    False,
+                )
+
+        route = (
+            "audited_reject"
+            if audited
+            else ("reference_confirm" if document_trial is not None else "compiler_fallback")
+        )
+        try:
+            compiler_trial = self.compiler_evaluator.begin(context, source, policy)
+            compiler_evaluation = compiler_trial.evaluation
+            compiler_verdict = self._predicate(
+                policy, context.role, compiler_evaluation
+            )
+        except BaseException:
+            if document_trial is not None:
+                try:
+                    self.document_evaluator.finish(document_trial, False)
+                except BaseException:
+                    pass
+            raise
+
+        if (
+            document_verdict is not None
+            and document_verdict != compiler_verdict
+        ):
+            direction = (
+                "false-negative" if not document_verdict else "false-positive"
+            )
+            reason = "document-%s" % direction
+            self.document_evaluator.disable(context, reason)
+
+        details = self._details(
+            route,
+            document_observation,
+            document_verdict,
+            compiler_evaluation,
+            compiler_verdict,
+            reason,
+            audited,
+            self.document_evaluator.identity,
+        )
+        return EvaluationTrial(
+            self._copy_with_details(compiler_evaluation, details),
+            HybridTrialToken(
+                route,
+                source,
+                context,
+                context.role,
+                policy.identity,
+                compiler_trial,
+                document_trial,
+                document_observation,
+                document_verdict,
+                compiler_verdict,
+                reason,
+                audited,
+            ),
+            bool(
+                compiler_verdict
+                and document_trial is not None
+                and document_verdict
+                and reason is None
+            ),
+            False,
+        )
+
+    def acceptance_authorized(self, trial, target_policy, role):
+        token = trial.token
+        return bool(
+            isinstance(token, HybridTrialToken)
+            and token.compiler_trial is not None
+            and token.source is not None
+            and token.role == role
+            and token.policy_identity == target_policy.identity
+            and token.compiler_verdict
+        )
+
+    def finish(self, trial, accepted):
+        token = trial.token
+        if not isinstance(token, HybridTrialToken):
+            raise CandidateLifecycleError("Invalid hybrid trial token")
+        if accepted and not (
+            token.compiler_trial is not None and token.compiler_verdict
+        ):
+            if token.document_trial is not None:
+                try:
+                    self.document_evaluator.finish(token.document_trial, False)
+                except BaseException:
+                    pass
+            raise CandidateLifecycleError(
+                "Hybrid acceptance lacks compiler authorization"
+            )
+        if token.compiler_trial is not None:
+            try:
+                self.compiler_evaluator.finish(token.compiler_trial, accepted)
+            except BaseException:
+                if token.document_trial is not None:
+                    try:
+                        self.document_evaluator.finish(token.document_trial, False)
+                    except BaseException:
+                        pass
+                raise
+        if token.document_trial is not None:
+            promote = bool(
+                accepted
+                and token.document_verdict
+                and token.compiler_verdict
+                and token.reason is None
+            )
+            try:
+                self.document_evaluator.finish(token.document_trial, promote)
+                if token.reason is not None:
+                    self.document_evaluator.disable(
+                        token.context, token.reason
+                    )
+                if accepted and not promote:
+                    self.document_evaluator.advance_accepted_source(token.source)
+            except BaseException as exc:
+                if accepted:
+                    # The already-written compiler-confirmed source is the
+                    # recovery checkpoint even if document promotion was lost.
+                    try:
+                        self.document_evaluator.advance_accepted_source(token.source)
+                    except BaseException:
+                        pass
+                    self._log(
+                        "rdm-hybrid state discarded after promotion failure: %s"
+                        % exc,
+                        level=1,
+                    )
+                else:
+                    raise
+        elif accepted:
+            self.document_evaluator.advance_accepted_source(token.source)
+        if accepted:
+            self._baseline_confirmed[token.context] = token.source
+
+    def record_target_decision(self, trial, target_policy, role):
+        token = trial.token
+        if not isinstance(token, HybridTrialToken):
+            return
+        record = {
+            "schema": 1,
+            "role": role,
+            "route": token.route,
+            "document_status": (
+                None
+                if token.document_observation is None
+                else token.document_observation.status
+            ),
+            "document_verdict": token.document_verdict,
+            "compiler_ran": token.compiler_trial is not None,
+            "compiler_verdict": token.compiler_verdict,
+            "agreement": (
+                None
+                if token.document_verdict is None or token.compiler_verdict is None
+                else token.document_verdict == token.compiler_verdict
+            ),
+            "audited": token.audited,
+            "reason": token.reason,
+        }
+        self._log(
+            "rdm-hybrid: %s"
+            % json.dumps(record, sort_keys=True, separators=(",", ":")),
+            level=1,
+        )
+
+    def reset_calibration(self, context=None):
+        self.compiler_evaluator.reset_calibration(context)
+        self._reject_counts.clear()
+        self._baseline_confirmed.clear()
+        try:
+            self.document_evaluator.reset()
+        except BaseException as exc:
+            self._log("rdm-hybrid reset failed: %s" % exc, level=1)
 
     def close(self):
         if self._closed:

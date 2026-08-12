@@ -583,7 +583,7 @@ class TargetPolicy(_TargetPolicyBase):
 
     @property
     def identity(self):
-        return tuple(self)
+        return (type(self).__name__,) + tuple(self)
 
     def primary_preserves(self, evaluation):
         if self.should_succeed:
@@ -598,6 +598,28 @@ class TargetPolicy(_TargetPolicyBase):
 
 
 LegacyTargetPolicy = TargetPolicy
+
+
+class StrictHybridTargetPolicy(TargetPolicy):
+    """Fail-closed target policy for decision-capable hybrid execution."""
+
+    __slots__ = ()
+
+    def primary_preserves(self, evaluation):
+        if self.should_succeed:
+            return self.passing_succeeds(evaluation)
+        if evaluation.status != EvaluationStatus.COMMAND_ERROR:
+            return False
+        return diagnose_error.has_error(evaluation.output, self.error_reg_string)
+
+    def passing_succeeds(self, evaluation):
+        return (
+            evaluation.status == EvaluationStatus.SUCCESS
+            and evaluation.returncode == 0
+            and not diagnose_error.has_error(evaluation.output)
+            and not diagnose_error.is_timeout(evaluation.output)
+            and not diagnose_error.is_memory_limit(evaluation.output)
+        )
 
 
 class CandidateAttempt(object):
@@ -717,6 +739,7 @@ CandidateCheckpoint = _tuple_value(
         "output_file_name",
         "primary_context",
         "passing_context",
+        "target_policy",
     ),
 )
 
@@ -732,11 +755,21 @@ class CandidateEvaluator(object):
     def requires_materialization_for_accept(self):
         return False
 
+    @property
+    def invalidates_cache_after_accept(self):
+        return False
+
     def materialize_context(self, spec):
         raise NotImplementedError
 
-    def begin(self, context, source):
+    def begin(self, context, source, target_policy=None):
         raise NotImplementedError
+
+    def acceptance_authorized(self, trial, target_policy, role):
+        """Return whether this exact live trial may authorize acceptance."""
+        if role == "passing":
+            return target_policy.passing_succeeds(trial.evaluation)
+        return target_policy.primary_preserves(trial.evaluation)
 
     def finish(self, trial, accepted):
         raise NotImplementedError
@@ -894,7 +927,7 @@ class CoqcEvaluator(CandidateEvaluator):
         )
         return result
 
-    def begin(self, context, source):
+    def begin(self, context, source, target_policy=None):
         self._ensure_open()
         result = self._run(context, source)
         metadata = (("stages", result.stages),)
@@ -1016,13 +1049,23 @@ class CandidateCheckCoordinator(object):
             if decision_key[0] == observation_key or decision_key[1] == observation_key:
                 del self._decisions[decision_key]
 
-    def _observation(self, context, source, bypass_cache):
-        key = (self.evaluator.identity, context, source)
+    def invalidate_observations(self):
+        """Drop run-level observations after stateful baseline/context change."""
+        self._ensure_usable()
+        if self._outstanding:
+            raise CandidateLifecycleError(
+                "Cannot invalidate observations with unresolved candidates"
+            )
+        self._observations.clear()
+        self._decisions.clear()
+
+    def _observation(self, context, source, target_policy, bypass_cache):
+        key = (self.evaluator.identity, context, source, target_policy.identity)
         may_read = not bypass_cache and not self._requires_resource_execution(context)
         if may_read and key in self._observations:
             evaluation = self._observations[key]
             return key, EvaluationTrial(evaluation, None, False, True), True
-        trial = self.evaluator.begin(context, source)
+        trial = self.evaluator.begin(context, source, target_policy)
         if not isinstance(trial, EvaluationTrial):
             raise CandidateEvaluatorError("Evaluator.begin did not return EvaluationTrial")
         if key in self._observations:
@@ -1051,7 +1094,7 @@ class CandidateCheckCoordinator(object):
             self._decisions.clear()
         primary_context = self.evaluator.materialize_context(primary_spec)
         primary_key, primary_trial, primary_cached = self._observation(
-            primary_context, source, bypass_cache
+            primary_context, source, target_policy, bypass_cache
         )
         primary_evaluation = primary_trial.evaluation
         passing_context = None
@@ -1076,7 +1119,7 @@ class CandidateCheckCoordinator(object):
             ):
                 passing_context = self.evaluator.materialize_context(passing_spec)
                 passing_key, passing_trial, passing_cached = self._observation(
-                    passing_context, source, bypass_cache
+                    passing_context, source, target_policy, bypass_cache
                 )
                 passing_evaluation = passing_trial.evaluation
                 passing_succeeds = target_policy.passing_succeeds(
@@ -1111,7 +1154,7 @@ class CandidateCheckCoordinator(object):
             if passing_evaluation is not None
             else (primary_evaluation,)
         )
-        decision_key = (primary_key, passing_key, target_policy)
+        decision_key = (primary_key, passing_key, target_policy.identity)
         summary = None if bypass_cache else self._decisions.get(decision_key)
         if summary is None:
             if not primary_preserves:
@@ -1149,12 +1192,51 @@ class CandidateCheckCoordinator(object):
                 )
             self._decisions[decision_key] = summary
 
+        if summary.result_type == CHANGE_SUCCESS:
+            authorization = (
+                (primary_trial, primary_context.role),
+            ) + (
+                ((passing_trial, passing_context.role),)
+                if passing_trial is not None
+                else ()
+            )
+            cached_unauthorized = any(
+                trial.from_cache for trial, role in authorization
+            )
+            live_unauthorized = any(
+                not trial.from_cache
+                and not self.evaluator.acceptance_authorized(
+                    trial, target_policy, role
+                )
+                for trial, role in authorization
+            )
+        else:
+            cached_unauthorized = False
+            live_unauthorized = False
+
         # Stateful evaluators must recreate live accepted state instead of
-        # accepting solely from an immutable observation cache.
+        # accepting solely from an immutable observation cache.  The explicit
+        # authorization check also prevents a rejection-only backend route
+        # from ever becoming acceptance authority.
+        if summary.result_type == CHANGE_SUCCESS and live_unauthorized:
+            for trial in reversed(
+                tuple(
+                    item
+                    for item in (passing_trial, primary_trial)
+                    if item is not None and not item.from_cache
+                )
+            ):
+                try:
+                    self.evaluator.finish(trial, False)
+                except BaseException:
+                    pass
+            raise CandidateEvaluatorError(
+                "Candidate acceptance was not authorized by the reference oracle"
+            )
         if (
             summary.result_type == CHANGE_SUCCESS
+            and cached_unauthorized
             and self.evaluator.requires_materialization_for_accept
-            and (primary_cached or passing_cached)
         ):
             if passing_trial is not None and not passing_trial.from_cache:
                 self.evaluator.finish(passing_trial, False)
@@ -1235,6 +1317,7 @@ class CandidateCheckCoordinator(object):
             output_file_name,
             attempt.primary_context,
             attempt.passing_context,
+            attempt.target_policy,
         )
         trials = self._live_trials(attempt)
         for index, trial in enumerate(trials):
@@ -1269,6 +1352,9 @@ class CandidateCheckCoordinator(object):
                 ) from exc
         attempt._mark_resolved()
         self._outstanding.discard(attempt)
+        if self.evaluator.invalidates_cache_after_accept:
+            self._observations.clear()
+            self._decisions.clear()
 
     def close(self):
         if self._closed:
