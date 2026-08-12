@@ -688,6 +688,29 @@ def test_hybrid_document_positive_requires_compiler_confirmation():
     assert document.finished[0][1] is True
 
 
+def test_hybrid_comparison_jsonl_retains_route_context_and_metrics(tmp_path):
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)
+    )
+    document = FakeDocumentEvaluator(
+        _document_observation("command_error", "Error: TARGET")
+    )
+    hybrid = _hybrid(compiler, document, [])
+    path = tmp_path / "comparisons.jsonl"
+    hybrid._jsonl_path = str(path)
+    Context = namedtuple("Context", "role")
+    policy = LegacyTargetPolicy(False, "TARGET")
+    trial = hybrid.begin(Context("primary"), "candidate", policy)
+    hybrid.record_target_decision(trial, policy, "primary")
+    record = json.loads(path.read_text())
+    assert record["event"] == "candidate-comparison"
+    assert record["mode"] == "rdm-hybrid"
+    assert record["context"] == {"role": "primary"}
+    assert record["source_sha256"]
+    assert record["document_split_runtime"] == 0.05
+    hybrid.finish(trial, False)
+
+
 def test_hybrid_compiler_fallback_acceptance_advances_raw_source():
     compiler = FakeCompilerEvaluator(
         Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)

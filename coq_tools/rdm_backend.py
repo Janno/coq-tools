@@ -133,7 +133,10 @@ RdmSessionTrial = namedtuple(
 )
 ShadowTrialToken = namedtuple(
     "ShadowTrialToken",
-    "compiler_trial document_trial document_observation unsupported_reason",
+    (
+        "source context compiler_trial document_trial document_observation "
+        "unsupported_reason"
+    ),
 )
 HybridTrialToken = namedtuple(
     "HybridTrialToken",
@@ -166,6 +169,58 @@ def _freeze_json(value):
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_json(item) for item in value)
     return value
+
+
+def _sha256_text(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _context_record(context):
+    if not hasattr(context, "resource_policy"):
+        return {"role": getattr(context, "role", None)}
+    request = context.resource_policy.request
+    return {
+        "evaluator_identity": context.evaluator_identity,
+        "executable": context.executable,
+        "executable_identity": context.executable_identity,
+        "arguments": context.arguments,
+        "cwd": context.cwd,
+        "environment_digest": context.environment.digest,
+        "environment_entry_count": context.environment.entry_count,
+        "logical_file": context.logical_file,
+        "top_name": context.top_name,
+        "is_toplevel": context.is_toplevel,
+        "pass_on_stdin": context.pass_on_stdin,
+        "checker_executable": context.checker_executable,
+        "checker_executable_identity": context.checker_executable_identity,
+        "checker_arguments": context.checker_arguments,
+        "resource_request": tuple(request),
+        "role": context.role,
+    }
+
+
+def _normalize_output(value):
+    value = re.sub(r'File "[^"]+", line [0-9-]+, characters [0-9-]+:', "", value)
+    return " ".join(value.split())
+
+
+def _append_jsonl(path, record):
+    if not path:
+        return
+    value = dict(record)
+    value.setdefault("timestamp", time.time())
+    case_id = os.environ.get("COQ_TOOLS_RDM_CASE_ID")
+    run_id = os.environ.get("COQ_TOOLS_RDM_RUN_ID")
+    if case_id:
+        value.setdefault("case_id", case_id)
+    if run_id:
+        value.setdefault("run_id", run_id)
+    payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(descriptor, payload)
+    finally:
+        os.close(descriptor)
 
 
 def _require_int(value, description, minimum=0):
@@ -1383,6 +1438,13 @@ class RdmSessionPool(object):
     def session_count(self):
         return len(self._sessions)
 
+    @property
+    def cursor_count(self):
+        return sum(
+            1 + session.active_trial_count
+            for session in self._sessions.values()
+        )
+
     def _manager_for(self, context):
         return (
             self.passing_manager
@@ -1764,6 +1826,7 @@ class RdmShadowEvaluator(CandidateEvaluator):
                     raise TypeError("compiler evaluator lacks %s" % name)
         self.compiler_evaluator = compiler_evaluator
         self._log = log or (lambda *args, **kwargs: None)
+        self._jsonl_path = os.environ.get("COQ_TOOLS_RDM_JSONL")
         self.document_evaluator = RdmEvaluator(
             primary_manager,
             accepted_source,
@@ -1872,6 +1935,8 @@ class RdmShadowEvaluator(CandidateEvaluator):
             details,
         )
         token = ShadowTrialToken(
+            source,
+            context,
             compiler_trial,
             document_trial,
             document_observation,
@@ -1970,6 +2035,42 @@ class RdmShadowEvaluator(CandidateEvaluator):
             % json.dumps(record, sort_keys=True, separators=(",", ":")),
             level=1,
         )
+        document = token.document_observation
+        pool = getattr(self.document_evaluator, "pool", None)
+        artifact = dict(record)
+        artifact.update(
+            {
+                "event": "candidate-comparison",
+                "mode": "rdm-shadow",
+                "source_sha256": _sha256_text(token.source),
+                "source_bytes": len(token.source.encode("utf-8")),
+                "context": _context_record(token.context),
+                "backend_identity": self.document_evaluator.identity,
+                "compiler_runtime": compiler_evaluation.runtime,
+                "compiler_peak_rss_kb": compiler_evaluation.peak_rss_kb,
+                "document_split_runtime": (
+                    None if document is None else document.split_runtime
+                ),
+                "document_execution_runtime": (
+                    None if document is None else document.execution_runtime
+                ),
+                "reused_items": None if document is None else document.reused_items,
+                "commands_replayed": (
+                    None if document is None else document.processed_items
+                ),
+                "candidate_items": None if document is None else document.candidate_items,
+                "diagnostic_agreement": (
+                    None
+                    if document is None
+                    else _normalize_output(compiler_evaluation.output)
+                    == _normalize_output(document.output)
+                ),
+                "restart_count": getattr(pool, "restart_count", None),
+                "live_session_count": getattr(pool, "session_count", None),
+                "live_cursor_count": getattr(pool, "cursor_count", None),
+            }
+        )
+        _append_jsonl(getattr(self, "_jsonl_path", None), artifact)
 
     def reset_calibration(self, context=None):
         self.compiler_evaluator.reset_calibration(context)
@@ -2032,6 +2133,7 @@ class RdmHybridEvaluator(CandidateEvaluator):
         self.compiler_evaluator = compiler_evaluator
         self.target_policy = target_policy
         self._log = log or (lambda *args, **kwargs: None)
+        self._jsonl_path = os.environ.get("COQ_TOOLS_RDM_JSONL")
         self._check_rejected_every = int(check_rejected_every)
         if self._check_rejected_every < 0:
             raise ValueError("check_rejected_every must not be negative")
@@ -2384,6 +2486,51 @@ class RdmHybridEvaluator(CandidateEvaluator):
             % json.dumps(record, sort_keys=True, separators=(",", ":")),
             level=1,
         )
+        document = token.document_observation
+        pool = getattr(self.document_evaluator, "pool", None)
+        compiler = (
+            None
+            if token.compiler_trial is None
+            else token.compiler_trial.evaluation
+        )
+        artifact = dict(record)
+        artifact.update(
+            {
+                "event": "candidate-comparison",
+                "mode": "rdm-hybrid",
+                "source_sha256": _sha256_text(token.source),
+                "source_bytes": len(token.source.encode("utf-8")),
+                "context": _context_record(token.context),
+                "backend_identity": self.document_evaluator.identity,
+                "compiler_status": None if compiler is None else compiler.status,
+                "compiler_runtime": None if compiler is None else compiler.runtime,
+                "compiler_peak_rss_kb": (
+                    None if compiler is None else compiler.peak_rss_kb
+                ),
+                "document_runtime": None if document is None else document.runtime,
+                "document_split_runtime": (
+                    None if document is None else document.split_runtime
+                ),
+                "document_execution_runtime": (
+                    None if document is None else document.execution_runtime
+                ),
+                "reused_items": None if document is None else document.reused_items,
+                "commands_replayed": (
+                    None if document is None else document.processed_items
+                ),
+                "candidate_items": None if document is None else document.candidate_items,
+                "diagnostic_agreement": (
+                    None
+                    if document is None or compiler is None
+                    else _normalize_output(compiler.output)
+                    == _normalize_output(document.output)
+                ),
+                "restart_count": getattr(pool, "restart_count", None),
+                "live_session_count": getattr(pool, "session_count", None),
+                "live_cursor_count": getattr(pool, "cursor_count", None),
+            }
+        )
+        _append_jsonl(getattr(self, "_jsonl_path", None), artifact)
 
     def reset_calibration(self, context=None):
         self.compiler_evaluator.reset_calibration(context)

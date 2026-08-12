@@ -1,0 +1,1737 @@
+{
+  "archive_policy": {
+    "definition": "Historical repository regression fixtures preserving complete Coq source and expected minimizer behavior. External issue URLs are not available for every pre-manifest fixture.",
+    "required_count": 20
+  },
+  "cases": [
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-000",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-000.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-001",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-001.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-002",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-002.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-003",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-003.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "non-candidate-tool",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-004",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-004.sh",
+      "source_revision": "103687e347de90ee465749196ffe0a507e75ceb2",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-005",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-005.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "differential",
+      "expected_fallback": null,
+      "expected_outcome": "disabled",
+      "id": "example-006",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-006.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-007",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-007.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-008-2",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-008-2.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "compiler-fallback",
+      "expected_fallback": "toplevel-or-stdin",
+      "expected_outcome": "pass",
+      "id": "example-008-3",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-008-3.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "non-candidate-tool",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-008",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-008.sh",
+      "source_revision": "103687e347de90ee465749196ffe0a507e75ceb2",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-009",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-009.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-010",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-010.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-011",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-011.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-012",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-012.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-013",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-013.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-014",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-014.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-015",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-015.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "differential",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-016",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-016.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-017",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-017.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "non-candidate-tool",
+      "expected_fallback": null,
+      "expected_outcome": "disabled",
+      "id": "example-018",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-018.sh",
+      "source_revision": "99598efa5eb99b8a31d9736fb4c7fda7fa84d30d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-019",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-019.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-020",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-020.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-021",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-021.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "non-candidate-tool",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-022",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-022.sh",
+      "source_revision": "103687e347de90ee465749196ffe0a507e75ceb2",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-023",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-023.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "non-candidate-tool",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-024",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-024.sh",
+      "source_revision": "944eae324c73aee4451992e007956edc69484ba3",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-025",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-025.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-026",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-026.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-027",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-027.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "differential",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-028",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-028.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "differential",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-029",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-029.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": "repository-regression-fixture",
+      "archived_bug": true,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-030",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-030.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-031",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-031.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "non-candidate-tool",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-032",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-032.sh",
+      "source_revision": "99598efa5eb99b8a31d9736fb4c7fda7fa84d30d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "non-candidate-tool",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-033",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-033.sh",
+      "source_revision": "99598efa5eb99b8a31d9736fb4c7fda7fa84d30d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "non-candidate-tool",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-034",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-034.sh",
+      "source_revision": "99598efa5eb99b8a31d9736fb4c7fda7fa84d30d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "differential",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-035",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-035.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-036",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-036.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-037",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-037.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "differential",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-038",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-038.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-039",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-039.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-040",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-040.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-041",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-041.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-042",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-042.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-043",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-043.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-044",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-044.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-045",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-045.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-046",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-046.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-047",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-047.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-048",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-048.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-049",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-049.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-050",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-050.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-051",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-051.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-052",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-052.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-053",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-053.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-054",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-054.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-055",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-055.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "disabled",
+      "id": "example-056",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-056.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-057",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-057.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-058",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-058.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-059",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-059.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-060",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-060.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-061",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-061.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-062",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-062.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "differential",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-063",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-063.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "non-candidate-tool",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-064",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-064.sh",
+      "source_revision": "99598efa5eb99b8a31d9736fb4c7fda7fa84d30d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "strict-success",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-065",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-065.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "strict-success",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-066",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-066.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-067",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-067.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "strict-success",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-068",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-068.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "strict-success",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-069",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-069.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "strict-success",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-070",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-070.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "strict-success",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-071",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-071.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-072",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-072.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "differential",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-073",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-073.sh",
+      "source_revision": "f498d5878eacdf3c1459215fa4056cb12fa7135d",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "compiler-fallback",
+      "expected_fallback": "memory-policy",
+      "expected_outcome": "pass",
+      "id": "example-075",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-075.sh",
+      "source_revision": "9e6c891cd181ed9c79dc1f0f05e223f405fa7baf",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    },
+    {
+      "archive_provenance": null,
+      "archived_bug": false,
+      "environment_keys": [
+        "PATH",
+        "COQBIN",
+        "PYTHON"
+      ],
+      "expected_category": "ordinary-command-error",
+      "expected_fallback": null,
+      "expected_outcome": "pass",
+      "id": "example-076",
+      "kind": "example-script",
+      "platforms": [
+        "linux"
+      ],
+      "script": "examples/run-example-076.sh",
+      "source_revision": "e7ca6f262be6997e3dee1af0d38b329783f09e2a",
+      "toolchains": [
+        "rocq-9.2-pinned"
+      ]
+    }
+  ],
+  "declared_configuration": {
+    "architecture": "x86_64",
+    "id": "rocq-9.2-linux-x86_64-pinned",
+    "manager": "rocq-doc-manager",
+    "manager_sha256": "8ef1e2e9a4637b48375ebf5ffabfe72a07df4e3511df794d9b4a5a605777b2c7",
+    "minimum_comparisons": 10000,
+    "platform": "linux",
+    "rocq_version": "9.2",
+    "timing_repetitions": 5,
+    "timing_warmups": 1
+  },
+  "description": "rocq-doc-manager differential corpus. Every version-controlled examples/run-example-*.sh case is named; twenty historical source regressions are designated archived bug fixtures.",
+  "schema": 1
+}
