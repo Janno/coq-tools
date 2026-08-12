@@ -9,6 +9,7 @@ from coq_tools.candidate_evaluator import (
     CHANGE_FAILURE,
     CHANGE_SUCCESS,
     CONTENTS_UNCHANGED,
+    CandidateChange,
     CandidateCheckCoordinator,
     CandidateCheckpoint,
     CandidateEvaluator,
@@ -95,7 +96,8 @@ class FakeEvaluator(CandidateEvaluator):
             role=spec.role,
         )
 
-    def begin(self, context, source, target_policy=None):
+    def begin(self, context, candidate, target_policy=None):
+        assert isinstance(candidate, CandidateChange)
         self.events.append("begin:%s" % context.executable[0])
         result = self.observations.pop(0)
         token = self.begin_count
@@ -134,8 +136,9 @@ def test_final_hybrid_verification_is_fresh_and_checks_both_roles(monkeypatch):
         def __init__(self, log, verbose_base=2):
             events.append("construct")
 
-        def begin(self, context, source, target_policy=None):
-            events.append(("begin", context, source, target_policy))
+        def begin(self, context, candidate, target_policy=None):
+            assert isinstance(candidate, CandidateChange)
+            events.append(("begin", context, candidate, target_policy))
             if context is primary:
                 value = Evaluation(
                     EvaluationStatus.COMMAND_ERROR, ERROR_TARGET, (), 1
@@ -158,9 +161,13 @@ def test_final_hybrid_verification_is_fresh_and_checks_both_roles(monkeypatch):
     assert events[-1] == "close"
 
 
+def _candidate(old_source, source):
+    return CandidateChange.from_sources(old_source, source)
+
+
 def make_env(tmp_path, observations, passing=False, events=None):
     evaluator = FakeEvaluator(observations, events=events)
-    coordinator = CandidateCheckCoordinator(evaluator)
+    coordinator = CandidateCheckCoordinator(evaluator, "old")
     env = {
         "candidate_check_coordinator": coordinator,
         "coqc": ("bad-coqc",),
@@ -259,8 +266,10 @@ def test_candidate_decision_matrix(
         tmp_path, observations, passing=passing_configured
     )
     env["should_succeed"] = should_succeed
-    decision = find_bug.classify_contents_change(
-        "old", "new", logical_file_name=str(tmp_path / "out.v"), **env
+    decision = find_bug.classify_candidate(
+        _candidate("old", "new"),
+        logical_file_name=str(tmp_path / "out.v"),
+        **env
     )
     assert decision.result_type == expected
     assert decision.bad_output_index == index
@@ -293,8 +302,11 @@ def test_context_specs_follow_each_request_and_preserve_explicit_memory_key(
 
 def test_unchanged_short_circuit_does_not_materialize_or_execute(tmp_path):
     env, evaluator, coordinator = make_env(tmp_path, [])
-    decision = find_bug.classify_contents_change(
-        "same", "same", logical_file_name=str(tmp_path / "out.v"), **env
+    coordinator.accepted_source = "same"
+    decision = find_bug.classify_candidate(
+        _candidate("same", "same"),
+        logical_file_name=str(tmp_path / "out.v"),
+        **env
     )
     assert decision.result_type == CONTENTS_UNCHANGED
     assert decision.evaluations == ()
@@ -310,8 +322,10 @@ def test_header_uses_primary_or_passing_runtime_and_peak(tmp_path):
     env["dynamic_header"] = (
         "(* runtime %(recent_runtime)s rss %(recent_peak_rss_kb)s *)"
     )
-    decision = find_bug.classify_contents_change(
-        "old", "new", logical_file_name=str(tmp_path / "out.v"), **env
+    decision = find_bug.classify_candidate(
+        _candidate("old", "new"),
+        logical_file_name=str(tmp_path / "out.v"),
+        **env
     )
     assert "runtime 7.5 rss 75.0" in decision.serialized_contents
     assert decision.runtime == 7.5
@@ -322,8 +336,10 @@ def test_header_uses_primary_or_passing_runtime_and_peak(tmp_path):
     env["dynamic_header"] = (
         "(* runtime %(recent_runtime)s rss %(recent_peak_rss_kb)s *)"
     )
-    decision = find_bug.classify_contents_change(
-        "old", "new", logical_file_name=str(tmp_path / "out.v"), **env
+    decision = find_bug.classify_candidate(
+        _candidate("old", "new"),
+        logical_file_name=str(tmp_path / "out.v"),
+        **env
     )
     assert "runtime 2.5 rss 25.0" in decision.serialized_contents
     coordinator.discard_candidate(decision.attempt)
@@ -336,8 +352,8 @@ def test_accepted_write_precedes_finish_and_checkpoint_separates_raw(tmp_path):
         tmp_path, [observation(ERROR_TARGET, 1)], events=events
     )
     evaluator.output_path = output_path
-    assert find_bug.check_change_and_write_to_file(
-        "old", "raw candidate", output_path, **env
+    assert find_bug.check_candidate_and_write_to_file(
+        _candidate("old", "raw candidate"), output_path, **env
     )
     assert os.path.exists(output_path)
     assert events[-1] == "finish:0:True"
@@ -354,8 +370,8 @@ def test_rejection_does_not_modify_main_output_and_writer_failure_discards(
     env, evaluator, coordinator = make_env(
         tmp_path, [observation(ERROR_OTHER, 1)]
     )
-    assert not find_bug.check_change_and_write_to_file(
-        "old", "rejected", str(output_path), **env
+    assert not find_bug.check_candidate_and_write_to_file(
+        _candidate("old", "rejected"), str(output_path), **env
     )
     assert output_path.read_text() == "canonical"
     assert evaluator.finished == [(0, False)]
@@ -369,8 +385,8 @@ def test_rejection_does_not_modify_main_output_and_writer_failure_discards(
 
     monkeypatch.setattr(find_bug, "write_to_file_or_shorten_name", failing_writer)
     with pytest.raises(IOError, match="writer failed"):
-        find_bug.check_change_and_write_to_file(
-            "old", "accepted", str(output_path), **env
+        find_bug.check_candidate_and_write_to_file(
+            _candidate("old", "accepted"), str(output_path), **env
         )
     assert evaluator.finished == [(0, False)]
     assert output_path.read_text() == "canonical"
@@ -395,9 +411,8 @@ def test_timeout_retry_count_bypasses_cache_and_writes_diagnostics_first(
     monkeypatch.setattr(
         find_bug, "write_to_file_or_shorten_name", recording_writer
     )
-    assert not find_bug.check_change_and_write_to_file(
-        "old",
-        "candidate",
+    assert not find_bug.check_candidate_and_write_to_file(
+        _candidate("old", "candidate"),
         str(tmp_path / "main.v"),
         timeout_retry_count=find_bug.SENSITIVE_TIMEOUT_RETRY_COUNT,
         write_to_temp_file=True,
@@ -424,9 +439,8 @@ def test_passing_timeout_retry_reruns_primary_and_passing(tmp_path):
     env, evaluator, coordinator = make_env(
         tmp_path, observations, passing=True, events=events
     )
-    assert not find_bug.check_change_and_write_to_file(
-        "old",
-        "candidate",
+    assert not find_bug.check_candidate_and_write_to_file(
+        _candidate("old", "candidate"),
         str(tmp_path / "main.v"),
         timeout_retry_count=find_bug.SENSITIVE_TIMEOUT_RETRY_COUNT,
         **env,
@@ -457,9 +471,8 @@ def test_rejected_temp_writer_exception_still_discards(tmp_path, monkeypatch):
 
     monkeypatch.setattr(find_bug, "write_to_file_or_shorten_name", failing_writer)
     with pytest.raises(RuntimeError, match="diagnostic write failed"):
-        find_bug.check_change_and_write_to_file(
-            "old",
-            "candidate",
+        find_bug.check_candidate_and_write_to_file(
+            _candidate("old", "candidate"),
             str(tmp_path / "main.v"),
             write_to_temp_file=True,
             **env,
@@ -473,8 +486,10 @@ def test_passing_rejection_description_preserves_legacy_command_text(tmp_path):
         [observation(ERROR_TARGET, 1), observation(ERROR_OTHER, 1)],
         passing=True,
     )
-    decision = find_bug.classify_contents_change(
-        "old", "candidate", logical_file_name=str(tmp_path / "out.v"), **env
+    decision = find_bug.classify_candidate(
+        _candidate("old", "candidate"),
+        logical_file_name=str(tmp_path / "out.v"),
+        **env
     )
     assert decision.description == (
         "The alternate coqc (good-coqc) was supposed to pass, but instead emitted an error.  "
@@ -503,8 +518,10 @@ def test_serialization_error_wins_over_discard_and_logging_errors(
         lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("serialize failed")),
     )
     with pytest.raises(ValueError, match="serialize failed"):
-        find_bug.classify_contents_change(
-            "old", "candidate", logical_file_name=str(tmp_path / "out.v"), **env
+        find_bug.classify_candidate(
+            _candidate("old", "candidate"),
+            logical_file_name=str(tmp_path / "out.v"),
+            **env
         )
 
 
@@ -519,8 +536,8 @@ def test_success_message_logging_failure_discards_before_return(tmp_path):
 
     env["log"] = selective_log
     with pytest.raises(RuntimeError, match="success log failed"):
-        find_bug.check_change_and_write_to_file(
-            "old", "candidate", str(tmp_path / "out.v"), **env
+        find_bug.check_candidate_and_write_to_file(
+            _candidate("old", "candidate"), str(tmp_path / "out.v"), **env
         )
     assert evaluator.finished == [(0, False)]
     assert not coordinator._outstanding
@@ -542,8 +559,8 @@ def test_accepted_finalization_failure_leaves_written_file_and_checkpoint(
 
     evaluator.finish = failing_accept
     with pytest.raises(CandidateFinalizationError) as excinfo:
-        find_bug.check_change_and_write_to_file(
-            "old", "raw candidate", str(output_path), **env
+        find_bug.check_candidate_and_write_to_file(
+            _candidate("old", "raw candidate"), str(output_path), **env
         )
     assert isinstance(excinfo.value.__cause__, RuntimeError)
     assert output_path.exists()

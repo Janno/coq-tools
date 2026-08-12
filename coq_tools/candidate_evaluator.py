@@ -85,6 +85,123 @@ def _tuple_value(name, fields):
     return type(name, (_TupleValue,), {"__slots__": (), "_fields": tuple(fields)})
 
 
+_TextEditBase = _tuple_value(
+    "_TextEditBase", ("start", "end", "replacement", "kind")
+)
+
+
+class TextEdit(_TextEditBase):
+    """One immutable replacement range, expressed in base-source characters."""
+
+    __slots__ = ()
+    KINDS = ("delete", "insert", "replace", "inferred")
+
+    def __new__(cls, start, end, replacement, kind="replace"):
+        if isinstance(start, bool) or not isinstance(start, int):
+            raise TypeError("Text edit start must be an integer")
+        if isinstance(end, bool) or not isinstance(end, int):
+            raise TypeError("Text edit end must be an integer")
+        if start < 0 or end < start:
+            raise ValueError("Text edit range is invalid")
+        if not isinstance(replacement, str):
+            raise TypeError("Text edit replacement must be text")
+        if kind not in cls.KINDS:
+            raise ValueError("Unknown text edit kind %r" % (kind,))
+        return _TextEditBase.__new__(cls, start, end, replacement, kind)
+
+
+_CandidateChangeBase = _tuple_value(
+    "_CandidateChangeBase", ("base_source", "source", "edits")
+)
+
+
+class CandidateChange(_CandidateChangeBase):
+    """A complete candidate source plus validated edits from its accepted base."""
+
+    __slots__ = ()
+
+    def __new__(cls, base_source, source, edits):
+        if not isinstance(base_source, str) or not isinstance(source, str):
+            raise TypeError("Candidate sources must be text")
+        normalized = []
+        previous_end = 0
+        for index, value in enumerate(tuple(edits)):
+            if not isinstance(value, TextEdit):
+                try:
+                    value = TextEdit(*tuple(value))
+                except (TypeError, ValueError):
+                    raise TypeError("Candidate edit %d is not a TextEdit" % index)
+            if value.start < previous_end:
+                raise ValueError("Candidate edits overlap or are out of order")
+            if value.end > len(base_source):
+                raise ValueError("Candidate edit lies outside the base source")
+            normalized.append(value)
+            previous_end = value.end
+        pieces = []
+        offset = 0
+        for edit in normalized:
+            pieces.append(base_source[offset : edit.start])
+            pieces.append(edit.replacement)
+            offset = edit.end
+        pieces.append(base_source[offset:])
+        if "".join(pieces) != source:
+            raise ValueError("Candidate edits do not reconstruct candidate source")
+        return _CandidateChangeBase.__new__(
+            cls, base_source, source, tuple(normalized)
+        )
+
+    @property
+    def base_source_sha256(self):
+        return hashlib.sha256(self.base_source.encode("utf-8")).hexdigest()
+
+    @property
+    def source_sha256(self):
+        return hashlib.sha256(self.source.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def splice(cls, base_source, start, end, replacement, kind=None):
+        if kind is None:
+            if start == end:
+                kind = "insert"
+            elif replacement == "":
+                kind = "delete"
+            else:
+                kind = "replace"
+        edit = TextEdit(start, end, replacement, kind)
+        source = base_source[:start] + replacement + base_source[end:]
+        return cls(base_source, source, (edit,))
+
+    @classmethod
+    def delete(cls, base_source, start, end):
+        return cls.splice(base_source, start, end, "", kind="delete")
+
+    @classmethod
+    def from_sources(cls, base_source, source):
+        if not isinstance(base_source, str) or not isinstance(source, str):
+            raise TypeError("Candidate sources must be text")
+        if base_source == source:
+            return cls(base_source, source, ())
+        prefix = 0
+        limit = min(len(base_source), len(source))
+        while prefix < limit and base_source[prefix] == source[prefix]:
+            prefix += 1
+        suffix = 0
+        suffix_limit = min(len(base_source) - prefix, len(source) - prefix)
+        while (
+            suffix < suffix_limit
+            and base_source[len(base_source) - suffix - 1]
+            == source[len(source) - suffix - 1]
+        ):
+            suffix += 1
+        old_end = len(base_source) - suffix
+        new_end = len(source) - suffix
+        return cls(
+            base_source,
+            source,
+            (TextEdit(prefix, old_end, source[prefix:new_end], "inferred"),),
+        )
+
+
 def _freeze(value):
     """Defensively convert common mutable containers to immutable values."""
     if isinstance(value, EnvironmentSnapshot):
@@ -629,7 +746,7 @@ class CandidateAttempt(object):
     """
 
     __slots__ = (
-        "_evaluated_source",
+        "_candidate",
         "_primary_context",
         "_primary_trial",
         "_primary_evaluation",
@@ -643,7 +760,7 @@ class CandidateAttempt(object):
 
     def __init__(
         self,
-        evaluated_source,
+        candidate,
         primary_context,
         primary_trial,
         primary_evaluation,
@@ -653,7 +770,9 @@ class CandidateAttempt(object):
         target_policy=None,
         cache_provenance=(),
     ):
-        object.__setattr__(self, "_evaluated_source", evaluated_source)
+        if not isinstance(candidate, CandidateChange):
+            raise TypeError("CandidateAttempt requires a CandidateChange")
+        object.__setattr__(self, "_candidate", candidate)
         object.__setattr__(self, "_primary_context", primary_context)
         object.__setattr__(self, "_primary_trial", primary_trial)
         object.__setattr__(self, "_primary_evaluation", primary_evaluation)
@@ -667,7 +786,7 @@ class CandidateAttempt(object):
     def __setattr__(self, name, value):
         raise AttributeError("CandidateAttempt fields are read-only")
 
-    evaluated_source = property(lambda self: self._evaluated_source)
+    candidate = property(lambda self: self._candidate)
     primary_context = property(lambda self: self._primary_context)
     primary_trial = property(lambda self: self._primary_trial)
     primary_evaluation = property(lambda self: self._primary_evaluation)
@@ -700,7 +819,7 @@ EvaluationVerdict = _tuple_value(
 
 
 _CandidateDecisionBase = _tuple_value(
-    "_CandidateDecisionBase", ("evaluated_source", "serialized_contents", "verdict")
+    "_CandidateDecisionBase", ("candidate", "serialized_contents", "verdict")
 )
 
 
@@ -762,7 +881,9 @@ class CandidateEvaluator(object):
     def materialize_context(self, spec):
         raise NotImplementedError
 
-    def begin(self, context, source, target_policy=None):
+    def begin(self, context, candidate, target_policy=None):
+        if not isinstance(candidate, CandidateChange):
+            raise TypeError("Evaluator.begin requires a CandidateChange")
         raise NotImplementedError
 
     def acceptance_authorized(self, trial, target_policy, role):
@@ -927,8 +1048,11 @@ class CoqcEvaluator(CandidateEvaluator):
         )
         return result
 
-    def begin(self, context, source, target_policy=None):
+    def begin(self, context, candidate, target_policy=None):
         self._ensure_open()
+        if not isinstance(candidate, CandidateChange):
+            raise TypeError("CoqcEvaluator.begin requires a CandidateChange")
+        source = candidate.source
         result = self._run(context, source)
         metadata = (("stages", result.stages),)
         final_context = context
@@ -999,8 +1123,11 @@ _DecisionSummary = namedtuple(
 class CandidateCheckCoordinator(object):
     """Run-owned candidate orchestration, memoization, and trial resolution."""
 
-    def __init__(self, evaluator):
+    def __init__(self, evaluator, accepted_source):
+        if not isinstance(accepted_source, str):
+            raise TypeError("Coordinator accepted source must be text")
         self.evaluator = evaluator
+        self.accepted_source = accepted_source
         self._observations = {}
         self._decisions = {}
         self._outstanding = set()
@@ -1059,13 +1186,18 @@ class CandidateCheckCoordinator(object):
         self._observations.clear()
         self._decisions.clear()
 
-    def _observation(self, context, source, target_policy, bypass_cache):
-        key = (self.evaluator.identity, context, source, target_policy.identity)
+    def _observation(self, context, candidate, target_policy, bypass_cache):
+        key = (
+            self.evaluator.identity,
+            context,
+            candidate.source,
+            target_policy.identity,
+        )
         may_read = not bypass_cache and not self._requires_resource_execution(context)
         if may_read and key in self._observations:
             evaluation = self._observations[key]
             return key, EvaluationTrial(evaluation, None, False, True), True
-        trial = self.evaluator.begin(context, source, target_policy)
+        trial = self.evaluator.begin(context, candidate, target_policy)
         if not isinstance(trial, EvaluationTrial):
             raise CandidateEvaluatorError("Evaluator.begin did not return EvaluationTrial")
         if key in self._observations:
@@ -1077,7 +1209,7 @@ class CandidateCheckCoordinator(object):
 
     def begin_candidate(
         self,
-        source,
+        candidate,
         primary_spec,
         passing_spec,
         target_policy,
@@ -1085,6 +1217,12 @@ class CandidateCheckCoordinator(object):
         reset_calibration=False,
     ):
         self._ensure_usable()
+        if not isinstance(candidate, CandidateChange):
+            raise TypeError("begin_candidate requires a CandidateChange")
+        if candidate.base_source != self.accepted_source:
+            raise CandidateLifecycleError(
+                "Candidate base source is not the coordinator's accepted source"
+            )
         if reset_calibration:
             self.evaluator.reset_calibration()
             # Context policies change across calibration reset.  Clearing both
@@ -1094,7 +1232,7 @@ class CandidateCheckCoordinator(object):
             self._decisions.clear()
         primary_context = self.evaluator.materialize_context(primary_spec)
         primary_key, primary_trial, primary_cached = self._observation(
-            primary_context, source, target_policy, bypass_cache
+            primary_context, candidate, target_policy, bypass_cache
         )
         primary_evaluation = primary_trial.evaluation
         passing_context = None
@@ -1119,7 +1257,7 @@ class CandidateCheckCoordinator(object):
             ):
                 passing_context = self.evaluator.materialize_context(passing_spec)
                 passing_key, passing_trial, passing_cached = self._observation(
-                    passing_context, source, target_policy, bypass_cache
+                    passing_context, candidate, target_policy, bypass_cache
                 )
                 passing_evaluation = passing_trial.evaluation
                 passing_succeeds = target_policy.passing_succeeds(
@@ -1243,7 +1381,7 @@ class CandidateCheckCoordinator(object):
             if not primary_trial.from_cache:
                 self.evaluator.finish(primary_trial, False)
             return self.begin_candidate(
-                source,
+                candidate,
                 primary_spec,
                 passing_spec,
                 target_policy,
@@ -1252,7 +1390,7 @@ class CandidateCheckCoordinator(object):
             )
 
         attempt = CandidateAttempt(
-            source,
+            candidate,
             primary_context,
             primary_trial,
             primary_evaluation,
@@ -1312,7 +1450,7 @@ class CandidateCheckCoordinator(object):
         if attempt.resolved:
             raise CandidateLifecycleError("Candidate attempt was already resolved")
         self.last_checkpoint = CandidateCheckpoint(
-            attempt.evaluated_source,
+            attempt.candidate.source,
             serialized_contents,
             output_file_name,
             attempt.primary_context,
@@ -1352,6 +1490,7 @@ class CandidateCheckCoordinator(object):
                 ) from exc
         attempt._mark_resolved()
         self._outstanding.discard(attempt)
+        self.accepted_source = attempt.candidate.source
         if self.evaluator.invalidates_cache_after_accept:
             self._observations.clear()
             self._decisions.clear()

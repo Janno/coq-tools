@@ -19,6 +19,7 @@ import time
 from collections import namedtuple
 
 from .candidate_evaluator import (
+    CandidateChange,
     CandidateEvaluator,
     CandidateLifecycleError,
     CoqcEvaluator,
@@ -125,11 +126,15 @@ RdmObservation = namedtuple(
     (
         "status output diagnostics runtime completion processed_items "
         "candidate_items replay_item reused_items split_runtime execution_runtime "
-        "cursor generation notifications"
+        "edit_strategy replaced_items cursor generation notifications"
     ),
 )
 RdmSessionTrial = namedtuple(
     "RdmSessionTrial", "session generation cursor source observation promotable"
+)
+ItemSplicePlan = namedtuple(
+    "ItemSplicePlan",
+    "start_item end_item source_offset replacement strategy",
 )
 ShadowTrialToken = namedtuple(
     "ShadowTrialToken",
@@ -154,6 +159,7 @@ REQUIRED_METHODS = frozenset(
         "clone",
         "go_to",
         "revert_before",
+        "clear_suffix",
         "replace_suffix",
         "run_step",
         "run_steps",
@@ -839,6 +845,13 @@ class RdmClient(object):
             ],
         )
 
+    def clear_suffix(self, cursor, count=None):
+        if count is not None:
+            count = _require_int(count, "count")
+        return self._null(
+            "clear_suffix", [_require_int(cursor, "cursor"), count]
+        )
+
     def replace_suffix(self, cursor, text, count=None):
         if count is not None:
             count = _require_int(count, "count")
@@ -1026,6 +1039,68 @@ def find_item_boundary(items, old_source, new_source):
     return item_index, offset
 
 
+def plan_item_splice(items, candidate, maximum_start_item=None):
+    """Plan a bounded item replacement for one validated source edit."""
+    if not isinstance(candidate, CandidateChange):
+        raise TypeError("Item splice planning requires a CandidateChange")
+    item_text = "".join(item.text for item in items)
+    if item_text != candidate.base_source:
+        raise RdmUnsupported(
+            "Document items do not reconstruct the candidate base source"
+        )
+    if len(candidate.edits) > 1:
+        return None
+    if candidate.edits:
+        edit = candidate.edits[0]
+        edit_start = edit.start
+        edit_end = edit.end
+        inserted = edit.replacement
+    else:
+        edit_start = len(candidate.base_source)
+        edit_end = edit_start
+        inserted = ""
+
+    boundaries = [0]
+    for item in items:
+        boundaries.append(boundaries[-1] + len(item.text))
+    start_item = 0
+    for index, offset in enumerate(boundaries):
+        if offset > edit_start:
+            break
+        start_item = index
+    end_item = len(items)
+    for index, offset in enumerate(boundaries):
+        if offset >= edit_end:
+            end_item = index
+            break
+    if maximum_start_item is not None and start_item > maximum_start_item:
+        start_item = maximum_start_item
+    if end_item < start_item:
+        end_item = start_item
+    start_offset = boundaries[start_item]
+    end_offset = boundaries[end_item]
+    replacement = (
+        candidate.base_source[start_offset:edit_start]
+        + inserted
+        + candidate.base_source[edit_end:end_offset]
+    )
+    reconstructed = (
+        candidate.base_source[:start_offset]
+        + replacement
+        + candidate.base_source[end_offset:]
+    )
+    if reconstructed != candidate.source:
+        return None
+    strategy = "clear" if replacement == "" else "replace"
+    return ItemSplicePlan(
+        start_item,
+        end_item,
+        start_offset,
+        replacement,
+        strategy,
+    )
+
+
 def offset_to_line_characters(source, bp, ep):
     """Convert absolute UTF-8 byte offsets to Coq line/character fields."""
     source_bytes = source.encode("utf-8")
@@ -1191,7 +1266,15 @@ class RdmSession(object):
         transport = getattr(self.client, "transport", None)
         return tuple(getattr(transport, "notifications", ()))
 
-    def _run_cursor(self, cursor, source, replay_item, split_runtime):
+    def _run_cursor(
+        self,
+        cursor,
+        source,
+        replay_item,
+        split_runtime,
+        edit_strategy="load",
+        replaced_items=None,
+    ):
         before_prefix = self.client.doc_prefix(cursor)
         suffix = self.client.doc_suffix(cursor)
         start = time.time()
@@ -1248,6 +1331,8 @@ class RdmSession(object):
             replay_item,
             split_runtime,
             execution_runtime,
+            edit_strategy,
+            replaced_items,
             cursor,
             self.generation,
             self._notifications(),
@@ -1258,32 +1343,51 @@ class RdmSession(object):
             self.canonical_cursor
         )
 
-    def begin(self, source):
+    def begin(self, candidate):
         if self._closed:
             raise RdmUnavailable("Document session is closed")
+        if not isinstance(candidate, CandidateChange):
+            raise TypeError("Document session requires a CandidateChange")
+        if candidate.base_source != self.accepted_source:
+            raise RdmUnsupported("Candidate base does not match accepted document")
+        source = candidate.source
         self.client.set_deadline(time.monotonic() + self._request_timeout)
         cursor = None
         try:
             cursor = self.client.clone(self.canonical_cursor)
             items = self._canonical_items()
-            replay_item, source_offset = find_item_boundary(
-                items, self.accepted_source, source
-            )
-            # A canonical error cursor cannot advance through its failing item.
-            # If the textual edit begins later, replay from the current cursor
-            # and reinstall the failing item together with the changed tail.
             canonical_index = len(self.client.doc_prefix(self.canonical_cursor))
-            if replay_item > canonical_index:
-                replay_item = canonical_index
-                source_offset = sum(
-                    len(item.text) for item in items[:canonical_index]
+            plan = plan_item_splice(
+                items, candidate, maximum_start_item=canonical_index
+            )
+            if plan is None:
+                replay_item, source_offset = find_item_boundary(
+                    items, self.accepted_source, source
                 )
+                if replay_item > canonical_index:
+                    replay_item = canonical_index
+                    source_offset = sum(
+                        len(item.text) for item in items[:canonical_index]
+                    )
+                replacement = source[source_offset:]
+                replace_count = None
+                strategy = "full_replace"
+            else:
+                replay_item = plan.start_item
+                source_offset = plan.source_offset
+                replacement = plan.replacement
+                replace_count = plan.end_item - plan.start_item
+                strategy = plan.strategy
             self.client.go_to(cursor, replay_item)
             split_start = time.time()
             try:
-                sentences = self.client.replace_suffix(
-                    cursor, source[source_offset:], None
-                )
+                if strategy == "clear":
+                    self.client.clear_suffix(cursor, replace_count)
+                    sentences = ()
+                else:
+                    sentences = self.client.replace_suffix(
+                        cursor, replacement, replace_count
+                    )
             except JsonRpcRequestError as exc:
                 split_error = parse_sentence_split_error(exc)
                 split_runtime = time.time() - split_start
@@ -1309,6 +1413,8 @@ class RdmSession(object):
                     replay_item,
                     split_runtime,
                     0.0,
+                    strategy,
+                    replace_count,
                     cursor,
                     self.generation,
                     self._notifications(),
@@ -1329,6 +1435,8 @@ class RdmSession(object):
                 source,
                 replay_item=replay_item,
                 split_runtime=split_runtime,
+                edit_strategy=strategy,
+                replaced_items=replace_count,
             )
             trial = RdmSessionTrial(
                 self, self.generation, cursor, source, observation, True
@@ -1517,11 +1625,11 @@ class RdmSessionPool(object):
             session = None
         return session or self._new_session(context)
 
-    def begin(self, context, source):
+    def begin(self, context, candidate):
         try:
             session = self._session(context)
             self._attempts[context] = self._attempts.get(context, 0) + 1
-            return session.begin(source)
+            return session.begin(candidate)
         except (JsonRpcError, OSError, EOFError):
             try:
                 self._drop(context)
@@ -1530,7 +1638,7 @@ class RdmSessionPool(object):
             self.restart_count += 1
             session = self._new_session(context)
             self._attempts[context] = 1
-            return session.begin(source)
+            return session.begin(candidate)
 
     def advance_accepted_source(self, source):
         """Record a compiler-confirmed acceptance without a document trial."""
@@ -1758,12 +1866,14 @@ class RdmEvaluator(object):
             except BaseException:
                 pass
 
-    def begin(self, context, source):
+    def begin(self, context, candidate):
+        if not isinstance(candidate, CandidateChange):
+            raise TypeError("Document evaluator requires a CandidateChange")
         reason = self.unsupported_reason(context)
         if reason is not None:
             raise RdmUnsupported(reason)
         try:
-            return self.pool.begin(context, source)
+            return self.pool.begin(context, candidate)
         except (RdmError, OSError, EOFError) as exc:
             reason = "%s: %s" % (type(exc).__name__, exc)
             self._disabled[context] = reason
@@ -1881,19 +1991,24 @@ class RdmShadowEvaluator(CandidateEvaluator):
             ("reused_items", observation.reused_items),
             ("split_runtime", observation.split_runtime),
             ("execution_runtime", observation.execution_runtime),
+            ("edit_strategy", observation.edit_strategy),
+            ("replaced_items", observation.replaced_items),
             ("cursor", observation.cursor),
             ("generation", observation.generation),
         )
 
-    def begin(self, context, source, target_policy=None):
+    def begin(self, context, candidate, target_policy=None):
         if self._closed:
             raise CandidateLifecycleError("Shadow evaluator is closed")
+        if not isinstance(candidate, CandidateChange):
+            raise TypeError("Shadow evaluator requires a CandidateChange")
+        source = candidate.source
         document_trial = None
         document_observation = None
         reason = self.document_evaluator.unsupported_reason(context)
         if reason is None:
             try:
-                document_trial = self.document_evaluator.begin(context, source)
+                document_trial = self.document_evaluator.begin(context, candidate)
                 document_observation = document_trial.observation
             except (RdmError, OSError, EOFError) as exc:
                 reason = "%s: %s" % (type(exc).__name__, exc)
@@ -1904,7 +2019,7 @@ class RdmShadowEvaluator(CandidateEvaluator):
         compiler_trial = None
         try:
             compiler_trial = self.compiler_evaluator.begin(
-                context, source, target_policy
+                context, candidate, target_policy
             )
         except BaseException:
             if document_trial is not None:
@@ -2059,6 +2174,8 @@ class RdmShadowEvaluator(CandidateEvaluator):
                     None if document is None else document.processed_items
                 ),
                 "candidate_items": None if document is None else document.candidate_items,
+                "edit_strategy": None if document is None else document.edit_strategy,
+                "replaced_items": None if document is None else document.replaced_items,
                 "diagnostic_agreement": (
                     None
                     if document is None
@@ -2196,7 +2313,8 @@ class RdmHybridEvaluator(CandidateEvaluator):
         accepted_source = self.document_evaluator.accepted_source
         if self._baseline_confirmed.get(context) == accepted_source:
             return None
-        trial = self.compiler_evaluator.begin(context, accepted_source, policy)
+        candidate = CandidateChange.from_sources(accepted_source, accepted_source)
+        trial = self.compiler_evaluator.begin(context, candidate, policy)
         try:
             healthy = self._predicate(policy, context.role, trial.evaluation)
         finally:
@@ -2244,9 +2362,12 @@ class RdmHybridEvaluator(CandidateEvaluator):
             tuple(evaluation.details) + (("rdm_hybrid", details),),
         )
 
-    def begin(self, context, source, target_policy=None):
+    def begin(self, context, candidate, target_policy=None):
         if self._closed:
             raise CandidateLifecycleError("Hybrid evaluator is closed")
+        if not isinstance(candidate, CandidateChange):
+            raise TypeError("Hybrid evaluator requires a CandidateChange")
+        source = candidate.source
         policy = target_policy or self.target_policy
         if policy.identity != self.target_policy.identity:
             raise RdmUnsupported("target-policy-mismatch")
@@ -2266,7 +2387,7 @@ class RdmHybridEvaluator(CandidateEvaluator):
                 self.document_evaluator.disable(context, reason)
         if reason is None:
             try:
-                document_trial = self.document_evaluator.begin(context, source)
+                document_trial = self.document_evaluator.begin(context, candidate)
                 document_observation = document_trial.observation
                 if document_observation.status == EvaluationStatus.PARSE_ERROR:
                     reason = "parser-target-is-compiler-only"
@@ -2328,7 +2449,7 @@ class RdmHybridEvaluator(CandidateEvaluator):
             else ("reference_confirm" if document_trial is not None else "compiler_fallback")
         )
         try:
-            compiler_trial = self.compiler_evaluator.begin(context, source, policy)
+            compiler_trial = self.compiler_evaluator.begin(context, candidate, policy)
             compiler_evaluation = compiler_trial.evaluation
             compiler_verdict = self._predicate(
                 policy, context.role, compiler_evaluation
@@ -2519,6 +2640,8 @@ class RdmHybridEvaluator(CandidateEvaluator):
                     None if document is None else document.processed_items
                 ),
                 "candidate_items": None if document is None else document.candidate_items,
+                "edit_strategy": None if document is None else document.edit_strategy,
+                "replaced_items": None if document is None else document.replaced_items,
                 "diagnostic_agreement": (
                     None
                     if document is None or compiler is None

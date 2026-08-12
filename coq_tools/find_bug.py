@@ -14,6 +14,7 @@ from .admit_abstract import transform_abstract_to_admit
 from .argparse_compat import argparse
 from .binding_util import process_maybe_list
 from .candidate_evaluator import (
+    CandidateChange,
     CandidateCheckCoordinator,
     CandidateDecision,
     CandidateEvaluatorError,
@@ -1430,16 +1431,20 @@ def _discard_candidate_preserving_active_exception(
             pass
 
 
-def classify_contents_change(
-    old_contents,
-    new_contents,
+def classify_candidate(
+    candidate,
     ignore_coq_output_cache=False,
     reset_timeout=False,
     should_succeed: bool = False,
     logical_file_name=None,
+    force_evaluation=False,
     **kwargs,
 ):
-    """Classify raw candidate source and return a named transaction decision."""
+    """Classify one structured candidate and return a transaction decision."""
+    if not isinstance(candidate, CandidateChange):
+        raise TypeError("classify_candidate requires a CandidateChange")
+    old_contents = candidate.base_source
+    new_contents = candidate.source
     kwargs["header_dict"] = kwargs.get(
         "header_dict",
         get_header_dict(
@@ -1447,7 +1452,7 @@ def classify_contents_change(
         ),
     )
 
-    if new_contents == old_contents:
+    if new_contents == old_contents and not force_evaluation:
         verdict = EvaluationVerdict(
             CONTENTS_UNCHANGED,
             (),
@@ -1459,7 +1464,7 @@ def classify_contents_change(
             None,
         )
         return CandidateDecision(
-            new_contents, prepend_header(new_contents, **kwargs), verdict
+            candidate, prepend_header(new_contents, **kwargs), verdict
         )
 
     coordinator = kwargs["candidate_check_coordinator"]
@@ -1477,7 +1482,7 @@ def classify_contents_change(
             should_succeed, kwargs.get("error_reg_string")
         )
     verdict = coordinator.begin_candidate(
-        new_contents,
+        candidate,
         primary_spec,
         passing_spec,
         target_policy,
@@ -1497,12 +1502,15 @@ def classify_contents_change(
             "a serialization-failed candidate",
         )
         raise
-    return CandidateDecision(new_contents, serialized_contents, verdict)
+    return CandidateDecision(candidate, serialized_contents, verdict)
 
 
-def check_change_and_write_to_file(
-    old_contents,
-    new_contents,
+def _candidate_from_source(source, coordinator):
+    return CandidateChange.from_sources(coordinator.accepted_source, source)
+
+
+def check_candidate_and_write_to_file(
+    candidate,
     output_file_name,
     unchanged_message="No change.",
     success_message="Change successful.",
@@ -1510,6 +1518,7 @@ def check_change_and_write_to_file(
     changed_description="Changed file",
     timeout_retry_count=1,
     ignore_coq_output_cache=False,
+    force_evaluation=False,
     verbose_base=1,
     display_source_to_error=False,
     write_to_temp_file=False,
@@ -1519,15 +1528,18 @@ def check_change_and_write_to_file(
     skip_extra_verbose_error_state=set(),
     **kwargs,
 ):
+    if not isinstance(candidate, CandidateChange):
+        raise TypeError("check_candidate_and_write_to_file requires a CandidateChange")
+    new_contents = candidate.source
     kwargs["log"](
         'Running coq on the file\n"""\n%s\n"""' % new_contents,
         level=2 + verbose_base,
     )
-    decision = classify_contents_change(
-        old_contents,
-        new_contents,
+    decision = classify_candidate(
+        candidate,
         ignore_coq_output_cache=ignore_coq_output_cache,
         logical_file_name=output_file_name,
+        force_evaluation=force_evaluation,
         **kwargs,
     )
     coordinator = kwargs["candidate_check_coordinator"]
@@ -1695,9 +1707,8 @@ def check_change_and_write_to_file(
                     raise
 
         if should_retry:
-            return check_change_and_write_to_file(
-                old_contents,
-                new_contents,
+            return check_candidate_and_write_to_file(
+                candidate,
                 output_file_name,
                 unchanged_message=unchanged_message,
                 success_message=success_message,
@@ -1705,6 +1716,7 @@ def check_change_and_write_to_file(
                 changed_description=changed_description,
                 timeout_retry_count=timeout_retry_count - 1,
                 ignore_coq_output_cache=True,
+                force_evaluation=force_evaluation,
                 verbose_base=verbose_base,
                 write_to_temp_file=write_to_temp_file,
                 display_extra_verbose_on_error=display_extra_verbose_on_error,
@@ -1715,13 +1727,8 @@ def check_change_and_write_to_file(
     if decision.attempt is not None:
         coordinator.discard_candidate(decision.attempt)
     kwargs["log"](
-        "ERROR: Unrecognized change result %s on\nclassify_contents_change(\n  %s\n ,%s\n)\n%s"
-        % (
-            decision.result_type,
-            repr(old_contents),
-            repr(new_contents),
-            repr(decision),
-        ),
+        "ERROR: Unrecognized change result %s on candidate %s\n%s"
+        % (decision.result_type, repr(candidate), repr(decision)),
         level=LOG_ALWAYS,
     )
     return None
@@ -1737,9 +1744,12 @@ def verify_final_hybrid_checkpoint(coordinator, log):
     evaluator = CoqcEvaluator(log=log, verbose_base=2)
     trials = []
     try:
+        candidate = CandidateChange.from_sources(
+            checkpoint.raw_source, checkpoint.raw_source
+        )
         primary = evaluator.begin(
             checkpoint.primary_context,
-            checkpoint.raw_source,
+            candidate,
             checkpoint.target_policy,
         )
         trials.append(primary)
@@ -1751,7 +1761,7 @@ def verify_final_hybrid_checkpoint(coordinator, log):
         if checkpoint.passing_context is not None:
             passing = evaluator.begin(
                 checkpoint.passing_context,
-                checkpoint.raw_source,
+                candidate,
                 checkpoint.target_policy,
             )
             trials.append(passing)
@@ -1927,9 +1937,11 @@ def try_transform_each(
                 kwargs["log"](
                     f"Skipping (at position {i}) based on cached failure", level=3
                 )
-            elif check_change_and_write_to_file(
-                "",
-                join_definitions(try_definitions),
+            elif check_candidate_and_write_to_file(
+                _candidate_from_source(
+                    join_definitions(try_definitions),
+                    kwargs["candidate_check_coordinator"],
+                ),
                 output_file_name,
                 verbose_base=2,
                 **kwargs,
@@ -2039,9 +2051,10 @@ def try_transform_reversed(
                     )
                 definitions = definitions[:i] + new_rest_definitions
 
-    if check_change_and_write_to_file(
-        "",
-        join_definitions(definitions),
+    if check_candidate_and_write_to_file(
+        _candidate_from_source(
+            join_definitions(definitions), kwargs["candidate_check_coordinator"]
+        ),
         output_file_name,
         success_message=kwargs["noun_description"] + " successful.",
         failure_description=kwargs["verb_description"],
@@ -2855,9 +2868,8 @@ def try_strip_comments(output_file_name, **kwargs):
     old_contents = contents
     new_contents = strip_comments(contents)
 
-    check_change_and_write_to_file(
-        old_contents,
-        new_contents,
+    check_candidate_and_write_to_file(
+        _candidate_from_source(new_contents, kwargs["candidate_check_coordinator"]),
         output_file_name,
         unchanged_message="No strippable comments.",
         success_message="Succeeded in stripping comments.",
@@ -2903,9 +2915,10 @@ def try_remove_duplicate_requires(definitions, output_file_name, **kwargs):
 
     new_definitions = list(yield_definitions())
 
-    if check_change_and_write_to_file(
-        join_definitions(definitions),
-        join_definitions(new_definitions),
+    if check_candidate_and_write_to_file(
+        _candidate_from_source(
+            join_definitions(new_definitions), kwargs["candidate_check_coordinator"]
+        ),
         output_file_name,
         success_message="Duplicate Require removal successful.",
         failure_description="remove duplicate Requires",
@@ -2932,9 +2945,8 @@ def try_normalize_requires(
 
     extra_desc = " (sorting by component)" if try_sort_requires_by_component else ""
 
-    if check_change_and_write_to_file(
-        old_contents,
-        new_contents,
+    if check_candidate_and_write_to_file(
+        _candidate_from_source(new_contents, kwargs["candidate_check_coordinator"]),
         output_file_name,
         unchanged_message="No Requires to normalize.",
         success_message=f"Succeeded in normalizing Requires{extra_desc}.",
@@ -2950,9 +2962,8 @@ def try_normalize_requires(
             sort_requires_by_component=False,
             **kwargs,
         )
-        return check_change_and_write_to_file(
-            old_contents,
-            new_contents,
+        return check_candidate_and_write_to_file(
+            _candidate_from_source(new_contents, kwargs["candidate_check_coordinator"]),
             output_file_name,
             success_message="Succeeded in normalizing Requires (without sorting by component).",
             failure_description="normalize Requires (without sorting by component)",
@@ -3105,9 +3116,10 @@ def try_lift_requires_and_maybe_custom_entry_declarations_and_maybe_insert_optio
     temp_file_name = f"{temp_file_base}.{suffix}{temp_ext}.orig"
     temp_log_file_name = f"{temp_log_file_base}.{suffix}{temp_log_ext}.orig"
 
-    if (all_custom_entries or inserted_new_options) and check_change_and_write_to_file(
-        join_definitions(definitions),
-        join_definitions(new_definitions),
+    if (all_custom_entries or inserted_new_options) and check_candidate_and_write_to_file(
+        _candidate_from_source(
+            join_definitions(new_definitions), kwargs["candidate_check_coordinator"]
+        ),
         output_file_name,
         success_message=f"Require{custom_entry_decl_singular} lifting{inserted_new_options_decl} successful.",
         failure_description=f"lift Requires{custom_entry_decl_plural}{inserted_new_options_decl}",
@@ -3181,9 +3193,8 @@ def try_split_requires(output_file_name, **kwargs):
         )
         return False
 
-    return check_change_and_write_to_file(
-        old_contents,
-        new_contents,
+    return check_candidate_and_write_to_file(
+        _candidate_from_source(new_contents, kwargs["candidate_check_coordinator"]),
         output_file_name,
         unchanged_message="No Requires to split.",
         success_message="Succeeded in splitting Requires.",
@@ -3202,9 +3213,8 @@ def try_strip_newlines(
         contents = "\n".join(line.rstrip() for line in contents.split("\n"))
     new_contents = strip_newlines(contents, max_consecutive_newlines)
 
-    check_change_and_write_to_file(
-        old_contents,
-        new_contents,
+    check_candidate_and_write_to_file(
+        _candidate_from_source(new_contents, kwargs["candidate_check_coordinator"]),
         output_file_name,
         unchanged_message="No strippable newlines or spaces.",
         success_message="Succeeded in stripping newlines and spaces.",
@@ -3227,9 +3237,10 @@ def try_strip_extra_lines(output_file_name, statements, line_num, **kwargs):
             new_statements = statements[: statement_num + 1]
             break
 
-    if check_change_and_write_to_file(
-        "\n".join(statements),
-        "\n".join(new_statements),
+    if check_candidate_and_write_to_file(
+        _candidate_from_source(
+            "\n".join(new_statements), kwargs["candidate_check_coordinator"]
+        ),
         output_file_name,
         unchanged_message="No lines to trim.",
         success_message=(
@@ -3373,9 +3384,8 @@ def try_strip_empty_sections(output_file_name, **kwargs):
             EMPTY_SECTION_REG.sub(r"\1", new_contents),
         )
 
-    check_change_and_write_to_file(
-        contents,
-        new_contents,
+    check_candidate_and_write_to_file(
+        _candidate_from_source(new_contents, kwargs["candidate_check_coordinator"]),
         output_file_name,
         unchanged_message="No empty sections to remove.",
         success_message="Empty section removal successful.",
@@ -3448,9 +3458,8 @@ def try_remove_admit_tactic_header(output_file_name, **kwargs):
     old_contents = contents
     new_contents = remove_admit_tactic(contents, **kwargs)
 
-    check_change_and_write_to_file(
-        old_contents,
-        new_contents,
+    check_candidate_and_write_to_file(
+        _candidate_from_source(new_contents, kwargs["candidate_check_coordinator"]),
         output_file_name,
         unchanged_message="No admit tactic header to remove",
         success_message="Admit tactic header removal successful.",
@@ -3464,9 +3473,8 @@ def try_add_admit_tactic_header(output_file_name, **kwargs):
     contents = read_from_file(output_file_name)
     old_contents = contents
     new_contents = add_admit_tactic(contents, **kwargs)
-    if not check_change_and_write_to_file(
-        old_contents,
-        new_contents,
+    if not check_candidate_and_write_to_file(
+        _candidate_from_source(new_contents, kwargs["candidate_check_coordinator"]),
         output_file_name,
         unchanged_message="Admit tactic wrapper already present!",
         success_message="Admit tactic wrapper added.",
@@ -3512,10 +3520,12 @@ def try_minimize_coqc_args(output_file_name, **env):
             remaining_groups = grouped_args[:i] + grouped_args[i + 1 :]
             reduced_args = tuple(arg for g in remaining_groups for arg in g)
 
-            if check_change_and_write_to_file(
-                "",
-                contents,
+            if check_candidate_and_write_to_file(
+                _candidate_from_source(
+                    contents, env["candidate_check_coordinator"]
+                ),
                 output_file_name,
+                force_evaluation=True,
                 success_message="Successfully removed argument%s %s"
                 % ("s" if len(group) > 1 else "", " ".join(group)),
                 failure_description="remove argument%s %s and preserve the error"
@@ -3573,9 +3583,10 @@ def try_minimize_coqc_args(output_file_name, **env):
             "Module %s.\n%s\nEnd %s.\n" % (top_name, raw_contents.strip(), top_name)
         )
 
-        if check_change_and_write_to_file(
-            contents,
-            wrapped_contents,
+        if check_candidate_and_write_to_file(
+            _candidate_from_source(
+                wrapped_contents, env["candidate_check_coordinator"]
+            ),
             output_file_name,
             success_message="Successfully replaced -top %s with Module %s wrapper"
             % (top_name, top_name),
@@ -3613,10 +3624,10 @@ def minimize_file(
 
     env["header_dict"] = get_header_dict(contents, **env)
 
-    if not check_change_and_write_to_file(
-        "",
-        contents,
+    if not check_candidate_and_write_to_file(
+        _candidate_from_source(contents, env["candidate_check_coordinator"]),
         output_file_name,
+        force_evaluation=True,
         unchanged_message="Invalid empty file!",
         success_message="Sanity check passed.",
         failure_description="validate all coq runs",
@@ -3681,10 +3692,12 @@ def minimize_file(
             % "\n".join(bad_strings)
         )
     statements = split_coq_file_contents(contents)
-    if not check_change_and_write_to_file(
-        "",
-        "\n".join(statements),
+    if not check_candidate_and_write_to_file(
+        _candidate_from_source(
+            "\n".join(statements), env["candidate_check_coordinator"]
+        ),
         output_file_name,
+        force_evaluation=True,
         unchanged_message="Invalid empty file!",
         success_message="Splitting successful.",
         failure_description="split file to statements",
@@ -3727,10 +3740,12 @@ def minimize_file(
     env["log"]("I am using the following file: %s" % "\n".join(statements), level=3)
     definitions = split_statements_to_definitions_with_options(statements, **env)
     env["log"](f"definitions: {definitions}", level=5)
-    if not check_change_and_write_to_file(
-        "",
-        join_definitions(definitions),
+    if not check_candidate_and_write_to_file(
+        _candidate_from_source(
+            join_definitions(definitions), env["candidate_check_coordinator"]
+        ),
         output_file_name,
+        force_evaluation=True,
         unchanged_message="Invalid empty file!",
         success_message="Splitting to definitions successful.",
         failure_description="split file to definitions",
@@ -3744,10 +3759,12 @@ def minimize_file(
         env["remove_useless_option_settings"] = False
         definitions = split_statements_to_definitions(statements, **env)
         env["log"](f"definitions: {definitions}", level=5)
-        if not check_change_and_write_to_file(
-            "",
-            join_definitions(definitions),
+        if not check_candidate_and_write_to_file(
+            _candidate_from_source(
+                join_definitions(definitions), env["candidate_check_coordinator"]
+            ),
             output_file_name,
+            force_evaluation=True,
             unchanged_message="Invalid empty file!",
             success_message="Splitting to definitions (without options settings) successful.",
             failure_description="split file to definitions (without options settings)",
@@ -4300,9 +4317,10 @@ def inline_one_require(
             (kwargs["min_inline_timeout"], 3 * int(math.ceil(runtime)))
         ) + (max(cur_timeout.values()) if cur_timeout else kwargs["default_timeout"])
 
-        if not check_change_and_write_to_file(
-            cur_output,
-            test_output,
+        if not check_candidate_and_write_to_file(
+            _candidate_from_source(
+                test_output, kwargs["candidate_check_coordinator"]
+            ),
             output_file_name,
             unchanged_message="Invalid empty file!",
             success_message=(
@@ -4320,9 +4338,10 @@ def inline_one_require(
             # only run the check up to the point of the
             # first success
             if not any(
-                check_change_and_write_to_file(
-                    cur_output,
-                    test_output_alt,
+                check_candidate_and_write_to_file(
+                    _candidate_from_source(
+                        test_output_alt, kwargs["candidate_check_coordinator"]
+                    ),
                     output_file_name,
                     unchanged_message="Invalid empty file!",
                     success_message=("Inlining %s%s succeeded." % (req_module, descr)),
@@ -4357,9 +4376,10 @@ def inline_one_require(
                 # for the original failure to inline,
                 # without the Include, so we can see
                 # what's going wrong in both cases
-                check_change_and_write_to_file(
-                    cur_output,
-                    test_output,
+                check_candidate_and_write_to_file(
+                    _candidate_from_source(
+                        test_output, kwargs["candidate_check_coordinator"]
+                    ),
                     output_file_name,
                     unchanged_message="Invalid empty file!",
                     success_message=(
@@ -5021,11 +5041,6 @@ def main():
 
         env["inlined_requires"] = set()
 
-        if env["backend"] == "coqc":
-            evaluator = CoqcEvaluator(log=env["log"], verbose_base=2)
-            candidate_check_coordinator = CandidateCheckCoordinator(evaluator)
-            env["candidate_check_coordinator"] = candidate_check_coordinator
-
         add_admit_tactic_wrapper = make_add_admit_tactic_wrapper(**env)
 
         # if env["minimize_before_inlining"] and not env["inline_one_at_a_time"]:
@@ -5069,6 +5084,13 @@ def main():
                         "The computed error message was not present in the given error log.",
                         **env,
                     )
+
+        if env["backend"] == "coqc":
+            evaluator = CoqcEvaluator(log=env["log"], verbose_base=2)
+            candidate_check_coordinator = CandidateCheckCoordinator(
+                evaluator, inlined_contents
+            )
+            env["candidate_check_coordinator"] = candidate_check_coordinator
 
         if env["backend"] in ("rdm-shadow", "rdm-hybrid"):
             compiler_evaluator = CoqcEvaluator(log=env["log"], verbose_base=2)
@@ -5129,7 +5151,9 @@ def main():
                     % (env["backend"], role, error),
                     level=1,
                 )
-            candidate_check_coordinator = CandidateCheckCoordinator(evaluator)
+            candidate_check_coordinator = CandidateCheckCoordinator(
+                evaluator, inlined_contents
+            )
             env["candidate_check_coordinator"] = candidate_check_coordinator
             env["candidate_target_policy"] = target_policy
 
@@ -5146,9 +5170,10 @@ def main():
                     inlined_contents = re.sub(
                         r"End [^ \.]*\.\s*$", "", inlined_contents
                     )
-                if not check_change_and_write_to_file(
-                    "",
-                    inlined_contents,
+                if not check_candidate_and_write_to_file(
+                    _candidate_from_source(
+                        inlined_contents, env["candidate_check_coordinator"]
+                    ),
                     output_file_name,
                     unchanged_message="Invalid empty file!",
                     success_message="Requires inlined.",

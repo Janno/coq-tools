@@ -498,6 +498,18 @@ def summarize_records(records, manifest=None):
         for item in final_ends
         if isinstance(item.get("runtime"), (int, float))
     ]
+    edit_strategy_counts = {}
+    edit_strategy_split_runtime = {}
+    for item in comparisons:
+        strategy = item.get("edit_strategy")
+        if strategy is None:
+            continue
+        edit_strategy_counts[strategy] = edit_strategy_counts.get(strategy, 0) + 1
+        runtime = item.get("document_split_runtime")
+        if isinstance(runtime, (int, float)):
+            edit_strategy_split_runtime[strategy] = (
+                edit_strategy_split_runtime.get(strategy, 0.0) + runtime
+            )
     return {
         "schema": 1,
         "case_starts": len(starts),
@@ -518,6 +530,8 @@ def summarize_records(records, manifest=None):
         "document_runtime_total": sum(document_runtimes),
         "document_split_runtime_total": sum(split_runtimes),
         "document_execution_runtime_total": sum(execution_runtimes),
+        "edit_strategy_counts": edit_strategy_counts,
+        "edit_strategy_split_runtime_total": edit_strategy_split_runtime,
         "case_runtime_total": sum(case_runtimes),
         "case_runtime_median": _median(case_runtimes),
         "reused_item_observations": len(reused_items),
@@ -663,6 +677,7 @@ def _median(values):
 
 def benchmark_prefix(arguments):
     from .candidate_evaluator import (
+        CandidateChange,
         CoqcEvaluator,
         EnvironmentSnapshot,
         EvaluationContextSpec,
@@ -709,7 +724,8 @@ def benchmark_prefix(arguments):
             compiler_started = time.monotonic()
             for candidate_index in range(arguments.candidates):
                 source = prefix + "Check I. (* candidate %d *)\n" % candidate_index
-                trial = compiler.begin(context, source, policy)
+                candidate = CandidateChange.from_sources(baseline, source)
+                trial = compiler.begin(context, candidate, policy)
                 compiler.finish(trial, False)
             compiler_runtime = time.monotonic() - compiler_started
 
@@ -719,7 +735,8 @@ def benchmark_prefix(arguments):
             current_reused = []
             for candidate_index in range(arguments.candidates):
                 source = prefix + "Check I. (* candidate %d *)\n" % candidate_index
-                trial = pool.begin(context, source)
+                candidate = CandidateChange.from_sources(baseline, source)
+                trial = pool.begin(context, candidate)
                 current_split.append(trial.observation.split_runtime)
                 current_execution.append(trial.observation.execution_runtime)
                 current_reused.append(trial.observation.reused_items)
@@ -783,6 +800,7 @@ def _rss_kb(pid):
 
 def long_session(arguments):
     from .candidate_evaluator import (
+        CandidateChange,
         CoqcEvaluator,
         EnvironmentSnapshot,
         EvaluationContextSpec,
@@ -821,8 +839,9 @@ def long_session(arguments):
     initial_rss = None
     started = time.monotonic()
     try:
+        candidate = CandidateChange.from_sources(source, source)
         for index in range(arguments.trials):
-            trial = pool.begin(context, source)
+            trial = pool.begin(context, candidate)
             pool.finish(trial, False)
             if index == 0 or (index + 1) % arguments.sample_every == 0:
                 session = pool._sessions.get(context)

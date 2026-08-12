@@ -11,12 +11,17 @@ import pytest
 
 from coq_tools import rdm_backend
 from coq_tools.candidate_evaluator import (
+    CandidateChange,
     EnvironmentSnapshot,
     Evaluation,
     EvaluationStatus,
     EvaluationTrial,
     LegacyTargetPolicy,
 )
+
+
+def _candidate(source, base="accepted"):
+    return CandidateChange.from_sources(base, source)
 
 
 def _frame(value):
@@ -283,6 +288,7 @@ def test_document_client_uses_exact_positional_rpc_shapes():
             7,
             None,
             None,
+            None,
             [],
             [],
             [],
@@ -296,6 +302,7 @@ def test_document_client_uses_exact_positional_rpc_shapes():
     assert client.clone(0) == 7
     assert client.go_to(7, 2) is None
     assert client.revert_before(7, False, 1) is None
+    assert client.clear_suffix(7, 2) is None
     assert client.replace_suffix(7, "Check I.\n", None) == ()
     assert client.doc_prefix(7) == ()
     assert client.doc_suffix(7) == ()
@@ -307,6 +314,7 @@ def test_document_client_uses_exact_positional_rpc_shapes():
         ("clone", [0]),
         ("go_to", [7, 2]),
         ("revert_before", [7, False, 1]),
+        ("clear_suffix", [7, 2]),
         ("replace_suffix", [7, "Check I.\n", None]),
         ("doc_prefix", [7]),
         ("doc_suffix", [7]),
@@ -415,6 +423,66 @@ def test_item_boundary_rolls_edits_inside_commands_back_to_command_start():
     ) == (2, len("Definition x := 0.\n"))
 
 
+def _item(kind, text):
+    return rdm_backend.DocumentItem(kind, text, (), None)
+
+
+def test_item_splice_plan_uses_counted_clear_for_whole_items():
+    base = "Definition a := 0.\n\nDefinition b := 1.\n"
+    items = (
+        _item("command", "Definition a := 0."),
+        _item("blanks", "\n\n"),
+        _item("command", "Definition b := 1."),
+        _item("blanks", "\n"),
+    )
+    candidate = CandidateChange.delete(base, 0, len("Definition a := 0.\n\n"))
+    plan = rdm_backend.plan_item_splice(items, candidate)
+    assert plan.strategy == "clear"
+    assert (plan.start_item, plan.end_item) == (0, 2)
+    assert plan.replacement == ""
+
+
+def test_item_splice_plan_expands_partial_command_and_preserves_tail():
+    base = "Definition a := 0.\nDefinition b := 1.\nCheck b.\n"
+    items = (
+        _item("command", "Definition a := 0."),
+        _item("blanks", "\n"),
+        _item("command", "Definition b := 1."),
+        _item("blanks", "\n"),
+        _item("command", "Check b."),
+        _item("blanks", "\n"),
+    )
+    candidate = CandidateChange.from_sources(
+        base, base.replace("b := 1", "b := 2")
+    )
+    plan = rdm_backend.plan_item_splice(items, candidate)
+    assert plan.strategy == "replace"
+    assert (plan.start_item, plan.end_item) == (2, 3)
+    assert plan.replacement == "Definition b := 2."
+    assert "Check b." not in plan.replacement
+
+
+def test_item_splice_plan_clamps_edits_after_canonical_error():
+    base = "Definition a := 0.\nCheck missing.\nCheck later.\n"
+    items = (
+        _item("command", "Definition a := 0."),
+        _item("blanks", "\n"),
+        _item("command", "Check missing."),
+        _item("blanks", "\n"),
+        _item("command", "Check later."),
+        _item("blanks", "\n"),
+    )
+    candidate = CandidateChange.from_sources(
+        base, base.replace("Check later.", "Check I.")
+    )
+    plan = rdm_backend.plan_item_splice(
+        items, candidate, maximum_start_item=2
+    )
+    assert plan.start_item == 2
+    assert plan.end_item == 5
+    assert plan.replacement == "Check missing.\nCheck I."
+
+
 def test_unicode_diagnostic_offsets_are_derived_from_candidate_bytes():
     source = "Definition α := True.\nCheck nope.\n"
     source_bytes = source.encode("utf-8")
@@ -445,6 +513,8 @@ def _document_observation(status, output):
         1,
         0.05,
         0.15,
+        "replace",
+        1,
         9,
         1,
         (),
@@ -466,8 +536,9 @@ class FakeCompilerEvaluator(object):
     def materialize_context(self, spec):
         return spec
 
-    def begin(self, context, source, target_policy=None):
-        self.begun.append((context, source))
+    def begin(self, context, candidate, target_policy=None):
+        assert isinstance(candidate, CandidateChange)
+        self.begun.append((context, candidate.source))
         if self.begin_error is not None:
             raise self.begin_error
         return EvaluationTrial(self.evaluation, "compiler", False, False)
@@ -503,8 +574,9 @@ class FakeDocumentEvaluator(object):
     def unsupported_reason(self, context):
         return self.reason
 
-    def begin(self, context, source):
-        self.begun.append((context, source))
+    def begin(self, context, candidate):
+        assert isinstance(candidate, CandidateChange)
+        self.begun.append((context, candidate.source))
         if self.begin_error is not None:
             raise self.begin_error
         return ShadowDocumentTrial(self.observation, True)
@@ -553,7 +625,7 @@ def test_shadow_evaluator_preserves_compiler_authority_and_logs_disagreement():
     Context = namedtuple("Context", "role")
     context = Context("primary")
 
-    trial = shadow.begin(context, "candidate")
+    trial = shadow.begin(context, _candidate("candidate"))
     assert trial.evaluation.as_legacy_tuple() == compiler_evaluation.as_legacy_tuple()
     assert trial.evaluation.status == EvaluationStatus.COMMAND_ERROR
     assert trial.evaluation.details[0] == ("compiler", "metadata")
@@ -578,7 +650,7 @@ def test_shadow_unavailability_never_skips_compiler_or_changes_output():
     document = FakeDocumentEvaluator(reason="unsupported context")
     shadow = _shadow(compiler, document, [])
     Context = namedtuple("Context", "role")
-    trial = shadow.begin(Context("primary"), "candidate")
+    trial = shadow.begin(Context("primary"), _candidate("candidate"))
     assert compiler.begun
     assert not document.begun
     assert trial.evaluation.output == "compiler output"
@@ -597,7 +669,7 @@ def test_shadow_promotion_failure_does_not_undo_compiler_acceptance():
     logs = []
     shadow = _shadow(compiler, document, logs)
     Context = namedtuple("Context", "role")
-    trial = shadow.begin(Context("primary"), "candidate")
+    trial = shadow.begin(Context("primary"), _candidate("candidate"))
     shadow.finish(trial, True)
     assert compiler.finished == [("compiler", True)]
     assert "state discarded after finalization failure" in logs[-1]
@@ -612,7 +684,7 @@ def test_compiler_infrastructure_failure_discards_live_shadow_trial():
     shadow = _shadow(compiler, document, [])
     Context = namedtuple("Context", "role")
     with pytest.raises(RuntimeError, match="compiler failed"):
-        shadow.begin(Context("primary"), "candidate")
+        shadow.begin(Context("primary"), _candidate("candidate"))
     assert document.finished[0][1] is False
 
 
@@ -645,7 +717,7 @@ def test_hybrid_reference_baseline_is_compiler_confirmed_before_fast_reject():
     Context = namedtuple("Context", "role")
     context = Context("primary")
     policy = LegacyTargetPolicy(False, "TARGET")
-    trial = hybrid.begin(context, "candidate", policy)
+    trial = hybrid.begin(context, _candidate("candidate"), policy)
     assert compiler.begun == [(context, "accepted")]
     assert trial.token.route == "fast_reject"
     hybrid.finish(trial, False)
@@ -660,7 +732,7 @@ def test_hybrid_fast_reject_skips_compiler_and_cannot_authorize_acceptance():
     Context = namedtuple("Context", "role")
     context = Context("primary")
     policy = LegacyTargetPolicy(False, "TARGET")
-    trial = hybrid.begin(context, "candidate", policy)
+    trial = hybrid.begin(context, _candidate("candidate"), policy)
     assert trial.token.route == "fast_reject"
     assert not compiler.begun
     assert not hybrid.acceptance_authorized(trial, policy, "primary")
@@ -679,7 +751,7 @@ def test_hybrid_document_positive_requires_compiler_confirmation():
     hybrid = _hybrid(compiler, document, [])
     Context = namedtuple("Context", "role")
     policy = LegacyTargetPolicy(False, "TARGET")
-    trial = hybrid.begin(Context("primary"), "candidate", policy)
+    trial = hybrid.begin(Context("primary"), _candidate("candidate"), policy)
     assert trial.token.route == "reference_confirm"
     assert compiler.begun
     assert hybrid.acceptance_authorized(trial, policy, "primary")
@@ -700,7 +772,7 @@ def test_hybrid_comparison_jsonl_retains_route_context_and_metrics(tmp_path):
     hybrid._jsonl_path = str(path)
     Context = namedtuple("Context", "role")
     policy = LegacyTargetPolicy(False, "TARGET")
-    trial = hybrid.begin(Context("primary"), "candidate", policy)
+    trial = hybrid.begin(Context("primary"), _candidate("candidate"), policy)
     hybrid.record_target_decision(trial, policy, "primary")
     record = json.loads(path.read_text())
     assert record["event"] == "candidate-comparison"
@@ -708,6 +780,8 @@ def test_hybrid_comparison_jsonl_retains_route_context_and_metrics(tmp_path):
     assert record["context"] == {"role": "primary"}
     assert record["source_sha256"]
     assert record["document_split_runtime"] == 0.05
+    assert record["edit_strategy"] == "replace"
+    assert record["replaced_items"] == 1
     hybrid.finish(trial, False)
 
 
@@ -719,7 +793,7 @@ def test_hybrid_compiler_fallback_acceptance_advances_raw_source():
     hybrid = _hybrid(compiler, document, [])
     Context = namedtuple("Context", "role")
     policy = LegacyTargetPolicy(False, "TARGET")
-    trial = hybrid.begin(Context("primary"), "new raw", policy)
+    trial = hybrid.begin(Context("primary"), _candidate("new raw"), policy)
     assert trial.token.route == "compiler_fallback"
     assert hybrid.acceptance_authorized(trial, policy, "primary")
     hybrid.finish(trial, True)
@@ -734,7 +808,7 @@ def test_hybrid_passing_requires_strict_compiler_success():
     hybrid = _hybrid(compiler, document, [])
     Context = namedtuple("Context", "role")
     policy = LegacyTargetPolicy(False, "TARGET")
-    trial = hybrid.begin(Context("passing"), "candidate", policy)
+    trial = hybrid.begin(Context("passing"), _candidate("candidate"), policy)
     assert trial.token.document_verdict is True
     assert trial.token.compiler_verdict is True
     assert hybrid.acceptance_authorized(trial, policy, "passing")
@@ -751,7 +825,7 @@ def test_hybrid_audit_detects_false_negative_and_disables_context():
     Context = namedtuple("Context", "role")
     context = Context("primary")
     policy = LegacyTargetPolicy(False, "TARGET")
-    trial = hybrid.begin(context, "candidate", policy)
+    trial = hybrid.begin(context, _candidate("candidate"), policy)
     assert trial.token.route == "audited_reject"
     assert trial.token.reason == "document-false-negative"
     assert document.disabled
@@ -789,7 +863,8 @@ def test_session_pool_restarts_once_from_accepted_source_after_process_failure(
             self.closed = False
             created.append(self)
 
-        def begin(self, source):
+        def begin(self, candidate):
+            assert isinstance(candidate, CandidateChange)
             if failures:
                 failures.pop()
                 raise rdm_backend.JsonRpcProcessError("server exited", 9, "boom")
@@ -798,7 +873,7 @@ def test_session_pool_restarts_once_from_accepted_source_after_process_failure(
                 self,
                 self.generation,
                 5,
-                source,
+                candidate.source,
                 baseline,
                 True,
             )
@@ -819,7 +894,7 @@ def test_session_pool_restarts_once_from_accepted_source_after_process_failure(
         "accepted",
         LegacyTargetPolicy(False, "TARGET"),
     )
-    trial = pool.begin(context, "candidate")
+    trial = pool.begin(context, _candidate("candidate"))
     assert len(created) == 2
     assert all(session.accepted_source == "accepted" for session in created)
     assert created[0].closed
@@ -852,10 +927,11 @@ def test_ten_thousand_trials_keep_one_live_session_with_restart_cap(monkeypatch)
             self.active_trial_count = 0
             created.append(self)
 
-        def begin(self, source):
+        def begin(self, candidate):
+            assert isinstance(candidate, CandidateChange)
             self.active_trial_count = 1
             return rdm_backend.RdmSessionTrial(
-                self, self.generation, 1, source, baseline, True
+                self, self.generation, 1, candidate.source, baseline, True
             )
 
         def finish(self, trial, accepted):
@@ -873,7 +949,7 @@ def test_ten_thousand_trials_keep_one_live_session_with_restart_cap(monkeypatch)
         restart_every=17,
     )
     for _ in range(10000):
-        trial = pool.begin(Context("primary"), "candidate")
+        trial = pool.begin(Context("primary"), _candidate("candidate"))
         pool.finish(trial, False)
         assert pool.session_count == 1
     assert pool.restart_count == 588
@@ -902,17 +978,27 @@ def test_real_document_session_promotes_raw_source_and_discards_rejection(tmp_pa
         (manager,), source, policy, restart_every=1
     )
     try:
-        preserving = pool.begin(context, "Check nope.\n")
+        preserving = pool.begin(
+            context, _candidate("Check nope.\n", source)
+        )
         assert preserving.observation.status == "command_error"
+        assert preserving.observation.edit_strategy == "clear"
+        assert preserving.observation.replaced_items == 2
         pool.finish(preserving, True)
         assert pool.accepted_source == "Check nope.\n"
 
-        rejected = pool.begin(context, "Check I.\n")
+        rejected = pool.begin(
+            context, _candidate("Check I.\n", "Check nope.\n")
+        )
         assert rejected.observation.status == "success"
+        assert rejected.observation.edit_strategy == "replace"
+        assert rejected.observation.replaced_items == 1
         pool.finish(rejected, False)
         assert pool.accepted_source == "Check nope.\n"
 
-        parse_error = pool.begin(context, "Check (\n")
+        parse_error = pool.begin(
+            context, _candidate("Check (\n", "Check nope.\n")
+        )
         assert parse_error.observation.status == "parse_error"
         assert "Error:" in parse_error.observation.output
         pool.finish(parse_error, False)
