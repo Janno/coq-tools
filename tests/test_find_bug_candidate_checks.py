@@ -663,6 +663,51 @@ def test_unchanged_short_circuit_does_not_materialize_or_execute(tmp_path):
     assert evaluator.begin_count == 0
 
 
+def test_equal_source_all_at_once_inlining_forces_compiler_validation(
+    tmp_path
+):
+    env, evaluator, coordinator = make_env(
+        tmp_path, [observation(ERROR_TARGET, 1)]
+    )
+    logs = []
+    env["log"] = lambda message, **kwargs: logs.append(str(message))
+    output_path = tmp_path / "out.v"
+    output_path.write_text(coordinator.accepted_source)
+
+    assert find_bug._check_all_at_once_inlining(
+        coordinator.accepted_source, str(output_path), **env
+    )
+
+    assert evaluator.begin_count == 1
+    assert evaluator.finished == [(0, True)]
+    assert coordinator.last_checkpoint.raw_source == coordinator.accepted_source
+    assert any("Requires inlined." in message for message in logs)
+    assert not any("Invalid empty file!" in message for message in logs)
+
+
+def test_equal_source_all_at_once_inlining_reports_evaluated_failure(
+    tmp_path
+):
+    env, evaluator, coordinator = make_env(
+        tmp_path, [observation(ERROR_OTHER, 1)]
+    )
+    logs = []
+    env["log"] = lambda message, **kwargs: logs.append(str(message))
+    output_path = tmp_path / "out.v"
+    output_path.write_text(coordinator.accepted_source)
+
+    assert not find_bug._check_all_at_once_inlining(
+        coordinator.accepted_source, str(output_path), **env
+    )
+
+    assert evaluator.begin_count == 1
+    assert evaluator.finished == [(0, False)]
+    assert coordinator.last_checkpoint is None
+    assert any("Failed to inline all requires" in message for message in logs)
+    assert any(ERROR_OTHER in message for message in logs)
+    assert not any("Invalid empty file!" in message for message in logs)
+
+
 def test_cli_exposes_explicit_unsafe_document_only_backend():
     backend_action = next(
         action

@@ -4641,6 +4641,24 @@ def inline_one_require(
     )
 
 
+def _check_all_at_once_inlining(inlined_contents, output_file_name, **kwargs):
+    """Validate the all-at-once result even when its source is unchanged."""
+    return check_candidate_and_write_to_file(
+        _candidate_from_source(
+            inlined_contents, kwargs["candidate_check_coordinator"]
+        ),
+        output_file_name,
+        unchanged_message="Invalid empty file!",
+        success_message="Requires inlined.",
+        failure_description="inline all requires",
+        changed_description="File",
+        timeout_retry_count=SENSITIVE_TIMEOUT_RETRY_COUNT,
+        write_to_temp_file=True,
+        force_evaluation=True,
+        **kwargs,
+    )
+
+
 def inline_all_requires(output_file_name, check_should_break, **kwargs):
     # so long as we keep changing, we will pull all the
     # requires to the top, then try to replace them in reverse
@@ -5396,18 +5414,8 @@ def main():
                     inlined_contents = re.sub(
                         r"End [^ \.]*\.\s*$", "", inlined_contents
                     )
-                if not check_candidate_and_write_to_file(
-                    _candidate_from_source(
-                        inlined_contents, env["candidate_check_coordinator"]
-                    ),
-                    output_file_name,
-                    unchanged_message="Invalid empty file!",
-                    success_message="Requires inlined.",
-                    failure_description="inline all requires",
-                    changed_description="File",
-                    timeout_retry_count=SENSITIVE_TIMEOUT_RETRY_COUNT,
-                    write_to_temp_file=True,
-                    **env,
+                if not _check_all_at_once_inlining(
+                    inlined_contents, output_file_name, **env
                 ):
                     env["log"](
                         "Failed to inline requires all at once, trying one by one..."
