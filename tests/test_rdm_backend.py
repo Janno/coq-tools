@@ -438,6 +438,46 @@ def test_document_error_parsers_validate_recoverable_payloads():
         rdm_backend.parse_steps_error(malformed)
 
 
+def test_command_diagnostic_keeps_outer_error_when_feedback_is_only_warning():
+    source = "Check missing.\n"
+    outer_error = "The reference missing was not found in the current environment."
+    warning = "This notation is deprecated."
+    error = rdm_backend.JsonRpcRequestError(
+        "run_steps",
+        3,
+        -32803,
+        outer_error,
+        {
+            "nb_processed": 0,
+            "cmd_error": {
+                "error_loc": {"bp": 6, "ep": 13},
+                "feedback_messages": [
+                    {"level": "warning", "text": warning, "loc": None}
+                ],
+            },
+        },
+    )
+
+    parsed = rdm_backend.parse_steps_error(error)
+    message, location, feedback = rdm_backend._select_command_message(parsed)
+    output = rdm_backend.render_diagnostic(
+        "/tmp/candidate.v", source, message, location=location
+    )
+    evaluation = Evaluation(
+        EvaluationStatus.COMMAND_ERROR, output, (), returncode=1
+    )
+
+    # Non-error feedback remains available as metadata, but must not replace
+    # the outer request error used for legacy target-regex matching.
+    assert feedback[0].level == "warning"
+    assert feedback[0].text == warning
+    assert message == outer_error
+    assert warning not in output
+    assert StrictHybridTargetPolicy(False, "reference missing").primary_preserves(
+        evaluation
+    )
+
+
 def test_capability_probe_parses_required_methods(tmp_path):
     server = tmp_path / "manager"
     methods = sorted(rdm_backend.REQUIRED_METHODS)

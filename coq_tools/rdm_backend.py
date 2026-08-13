@@ -1285,11 +1285,7 @@ def _select_command_message(parsed_error):
     errors = [
         item for item in command_error.feedback_messages if item.level == "error"
     ]
-    selected = errors[0] if errors else (
-        command_error.feedback_messages[0]
-        if command_error.feedback_messages
-        else None
-    )
+    selected = errors[0] if errors else None
     message = selected.text if selected is not None else parsed_error.message
     location = command_error.error_loc
     if location is None and selected is not None:
