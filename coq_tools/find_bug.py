@@ -67,6 +67,7 @@ from .custom_arguments import (
 from .file_util import (
     clean_v_file,
     read_from_file,
+    write_bytes_to_file,
     write_to_file,
     write_to_file_or_shorten_name,
 )
@@ -1791,6 +1792,86 @@ def check_candidate_and_write_to_file(
         level=LOG_ALWAYS,
     )
     return None
+
+
+def ensure_final_hybrid_checkpoint(
+    coordinator, output_file_name, **kwargs
+):
+    """Create a final compiler-confirmed checkpoint when no edit was accepted."""
+    if coordinator.last_checkpoint is not None:
+        return coordinator.last_checkpoint
+    raw_source = coordinator.accepted_source
+    try:
+        disk_source = read_from_file(output_file_name)
+    except (IOError, OSError, UnicodeError) as exc:
+        raise CandidateEvaluatorError(
+            "Unable to read checkpoint-free hybrid output %s: %s"
+            % (output_file_name, exc)
+        )
+    if disk_source != raw_source:
+        raise CandidateEvaluatorError(
+            "Hybrid output has no accepted checkpoint and differs from the "
+            "coordinator's accepted source: %s" % output_file_name
+        )
+    accepted = check_candidate_and_write_to_file(
+        CandidateChange.from_sources(raw_source, raw_source),
+        output_file_name,
+        force_evaluation=True,
+        ignore_coq_output_cache=True,
+        timeout_retry_count=SENSITIVE_TIMEOUT_RETRY_COUNT,
+        success_message="Initial hybrid checkpoint confirmed.",
+        failure_description="confirm the initial hybrid checkpoint",
+        changed_description="File",
+        write_to_temp_file=True,
+        **kwargs,
+    )
+    if not accepted or coordinator.last_checkpoint is None:
+        raise CandidateEvaluatorError(
+            "Hybrid final verification could not confirm an initial checkpoint"
+        )
+    return coordinator.last_checkpoint
+
+
+def ensure_and_verify_final_hybrid_checkpoint(
+    coordinator, output_file_name, **kwargs
+):
+    """Verify final output, rolling back a newly-created fallback on failure."""
+    if coordinator.last_checkpoint is not None:
+        verify_final_hybrid_checkpoint(coordinator, kwargs["log"])
+        return coordinator.last_checkpoint
+
+    try:
+        with open(output_file_name, "rb") as source:
+            original_output_bytes = source.read()
+    except (IOError, OSError) as exc:
+        raise CandidateEvaluatorError(
+            "Unable to snapshot checkpoint-free hybrid output %s: %s"
+            % (output_file_name, exc)
+        )
+
+    checkpoint = ensure_final_hybrid_checkpoint(
+        coordinator, output_file_name, **kwargs
+    )
+    try:
+        verify_final_hybrid_checkpoint(coordinator, kwargs["log"])
+    except BaseException as verification_error:
+        # The fallback candidate was compiler-confirmed before serialization,
+        # but a semantic header may make the delivered serialization invalid.
+        # Do not leave either that output or its unverified checkpoint behind.
+        coordinator.last_checkpoint = None
+        try:
+            checkpoint_path = os.path.abspath(checkpoint.output_file_name)
+            original_path = os.path.abspath(output_file_name)
+            if checkpoint_path != original_path and os.path.exists(checkpoint_path):
+                clean_v_file(checkpoint_path)
+            write_bytes_to_file(original_path, original_output_bytes)
+        except BaseException as rollback_error:
+            raise CandidateEvaluatorError(
+                "Hybrid final verification failed and the original output "
+                "could not be restored: %s" % rollback_error
+            ) from verification_error
+        raise
+    return checkpoint
 
 
 def verify_final_hybrid_checkpoint(coordinator, log):
@@ -5417,8 +5498,8 @@ def main():
                 env["coqc_args"] = minimized_args
 
         if env["backend"] == "rdm-hybrid":
-            verify_final_hybrid_checkpoint(
-                candidate_check_coordinator, env["log"]
+            ensure_and_verify_final_hybrid_checkpoint(
+                candidate_check_coordinator, output_file_name, **env
             )
 
     except EOFError:

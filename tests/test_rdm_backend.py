@@ -12,6 +12,7 @@ import pytest
 from coq_tools import rdm_backend
 from coq_tools.candidate_evaluator import (
     CandidateChange,
+    CandidateCheckCoordinator,
     EnvironmentSnapshot,
     Evaluation,
     EvaluationStatus,
@@ -574,9 +575,17 @@ class FakeCompilerEvaluator(object):
     identity = ("fake-compiler",)
     requires_materialization_for_accept = False
 
-    def __init__(self, evaluation, begin_error=None):
+    def __init__(
+        self,
+        evaluation,
+        begin_error=None,
+        finish_error=None,
+        close_error=None,
+    ):
         self.evaluation = evaluation
         self.begin_error = begin_error
+        self.finish_error = finish_error
+        self.close_error = close_error
         self.begun = []
         self.finished = []
         self.closed = False
@@ -594,29 +603,42 @@ class FakeCompilerEvaluator(object):
 
     def finish(self, trial, accepted):
         self.finished.append((trial.token, accepted))
+        if self.finish_error is not None:
+            raise self.finish_error
 
     def reset_calibration(self, context=None):
         self.reset_count += 1
 
     def close(self):
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class FakeDocumentEvaluator(object):
     identity = ("fake-document",)
 
     def __init__(
-        self, observation=None, reason=None, begin_error=None, finish_error=None
+        self,
+        observation=None,
+        reason=None,
+        begin_error=None,
+        finish_error=None,
+        advance_error=None,
+        close_error=None,
     ):
         self.observation = observation
         self.reason = reason
         self.begin_error = begin_error
         self.finish_error = finish_error
+        self.advance_error = advance_error
+        self.close_error = close_error
         self.begun = []
         self.finished = []
         self.closed = False
         self.reset_count = 0
         self.disabled = []
+        self.quarantined = []
         self.advanced = []
         self.accepted_source = "accepted"
 
@@ -638,14 +660,25 @@ class FakeDocumentEvaluator(object):
     def disable(self, context, reason):
         self.disabled.append((context, reason))
 
+    def quarantine(self, context, reason, accepted_source=None):
+        self.quarantined.append((context, reason, accepted_source))
+        self.disabled.append((context, reason))
+        if accepted_source is not None:
+            self.accepted_source = accepted_source
+
     def advance_accepted_source(self, source):
         self.advanced.append(source)
+        self.accepted_source = source
+        if self.advance_error is not None:
+            raise self.advance_error
 
     def reset(self):
         self.reset_count += 1
 
     def close(self):
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 def _document_only(context_evaluator, document, logs):
@@ -906,6 +939,26 @@ def test_hybrid_reference_baseline_is_compiler_confirmed_before_fast_reject():
     hybrid.finish(trial, False)
 
 
+def test_hybrid_reference_baseline_compiler_finalization_failure_is_fatal():
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1),
+        finish_error=RuntimeError("compiler baseline finalization failed"),
+    )
+    document = FakeDocumentEvaluator(_document_observation("success", ""))
+    hybrid = _hybrid(compiler, document, [])
+    hybrid._baseline_confirmed = {}
+    Context = namedtuple("Context", "role")
+    context = Context("primary")
+    policy = LegacyTargetPolicy(False, "TARGET")
+
+    with pytest.raises(RuntimeError, match="compiler baseline finalization failed"):
+        hybrid.begin(context, _candidate("candidate"), policy)
+
+    assert compiler.begun == [(context, "accepted")]
+    assert compiler.finished == [("compiler", False)]
+    assert document.begun == []
+
+
 def test_hybrid_fast_reject_skips_compiler_and_cannot_authorize_acceptance():
     compiler = FakeCompilerEvaluator(
         Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)
@@ -982,6 +1035,245 @@ def test_hybrid_compiler_fallback_acceptance_advances_raw_source():
     assert hybrid.acceptance_authorized(trial, policy, "primary")
     hybrid.finish(trial, True)
     assert document.advanced == ["new raw"]
+
+
+def test_hybrid_compiler_fallback_advance_failure_is_quarantined():
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)
+    )
+    document = FakeDocumentEvaluator(
+        reason="unsupported context",
+        advance_error=RuntimeError("stale session close failed"),
+    )
+    logs = []
+    hybrid = _hybrid(compiler, document, logs)
+    Context = namedtuple("Context", "role")
+    context = Context("primary")
+    policy = LegacyTargetPolicy(False, "TARGET")
+    trial = hybrid.begin(context, _candidate("new raw"), policy)
+
+    hybrid.finish(trial, True)
+
+    assert compiler.finished == [("compiler", True)]
+    assert document.accepted_source == "new raw"
+    assert document.quarantined[-1][0] == context
+    assert document.quarantined[-1][2] == "new raw"
+    assert "optional document state discarded" in logs[-1]
+
+
+def test_hybrid_fallback_cleanup_failure_does_not_poison_coordinator():
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)
+    )
+    document = FakeDocumentEvaluator(
+        reason="unsupported context",
+        advance_error=RuntimeError("stale session close failed"),
+    )
+    hybrid = _hybrid(compiler, document, [])
+    coordinator = CandidateCheckCoordinator(hybrid, "accepted")
+    Request = namedtuple(
+        "Request", "max_mem_rss max_mem_as max_mem_rss_multiplier "
+        "max_mem_as_multiplier cgroup"
+    )
+    Timeout = namedtuple("Timeout", "should_calibrate_timeout")
+    Policy = namedtuple("Policy", "timeout_policy request")
+    Context = namedtuple("Context", "role resource_policy")
+    context = Context(
+        "primary",
+        Policy(Timeout(False), Request(None, None, None, None, None)),
+    )
+    policy = LegacyTargetPolicy(False, "TARGET")
+    verdict = coordinator.begin_candidate(
+        _candidate("new raw"), context, None, policy
+    )
+
+    coordinator.commit_candidate(verdict.attempt, "serialized", "out.v")
+
+    assert coordinator.healthy
+    assert coordinator.accepted_source == "new raw"
+    assert document.accepted_source == "new raw"
+
+
+def test_hybrid_accepted_promotion_failure_is_quarantined():
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)
+    )
+    document = FakeDocumentEvaluator(
+        _document_observation("command_error", "Error: TARGET"),
+        finish_error=RuntimeError("promotion dispose failed"),
+    )
+    hybrid = _hybrid(compiler, document, [])
+    Context = namedtuple("Context", "role")
+    context = Context("primary")
+    policy = LegacyTargetPolicy(False, "TARGET")
+    trial = hybrid.begin(context, _candidate("new raw"), policy)
+
+    hybrid.finish(trial, True)
+
+    assert compiler.finished == [("compiler", True)]
+    assert document.quarantined[-1][0] == context
+    assert document.quarantined[-1][2] == "new raw"
+    assert document.accepted_source == "new raw"
+
+
+def test_hybrid_fast_reject_cleanup_failure_preserves_rejection():
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: TARGET", (), 1)
+    )
+    document = FakeDocumentEvaluator(
+        _document_observation("success", ""),
+        finish_error=RuntimeError("dispose failed"),
+    )
+    hybrid = _hybrid(compiler, document, [])
+    Context = namedtuple("Context", "role")
+    context = Context("primary")
+    policy = LegacyTargetPolicy(False, "TARGET")
+    trial = hybrid.begin(context, _candidate("rejected"), policy)
+    assert trial.token.route == "fast_reject"
+
+    hybrid.finish(trial, False)
+
+    assert compiler.begun == []
+    assert document.accepted_source == "accepted"
+    assert document.quarantined[-1][0] == context
+    assert document.quarantined[-1][2] is None
+
+
+def test_hybrid_rejected_reference_cleanup_failure_is_quarantined():
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.COMMAND_ERROR, "Error: OTHER", (), 1)
+    )
+    document = FakeDocumentEvaluator(
+        _document_observation("command_error", "Error: TARGET"),
+        finish_error=RuntimeError("dispose failed"),
+    )
+    hybrid = _hybrid(compiler, document, [])
+    Context = namedtuple("Context", "role")
+    context = Context("primary")
+    policy = LegacyTargetPolicy(False, "TARGET")
+    trial = hybrid.begin(context, _candidate("rejected"), policy)
+    assert trial.token.compiler_verdict is False
+
+    hybrid.finish(trial, False)
+
+    assert compiler.finished == [("compiler", False)]
+    assert document.accepted_source == "accepted"
+    assert document.quarantined[-1][2] is None
+
+
+def test_hybrid_close_ignores_document_error_but_not_compiler_error():
+    document_error = RuntimeError("document close failed")
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.SUCCESS, "", (), 0)
+    )
+    document = FakeDocumentEvaluator(close_error=document_error)
+    logs = []
+    hybrid = _hybrid(compiler, document, logs)
+    hybrid.close()
+    assert document.closed
+    assert compiler.closed
+    assert "ignored optional document close failure" in logs[-1]
+
+    compiler_error = RuntimeError("compiler close failed")
+    compiler = FakeCompilerEvaluator(
+        Evaluation(EvaluationStatus.SUCCESS, "", (), 0),
+        close_error=compiler_error,
+    )
+    document = FakeDocumentEvaluator(close_error=document_error)
+    hybrid = _hybrid(compiler, document, [])
+    with pytest.raises(RuntimeError, match="compiler close failed"):
+        hybrid.close()
+    assert document.closed
+    assert compiler.closed
+
+
+def test_session_pool_advancement_drops_all_inactive_sessions_after_error():
+    Context = namedtuple("Context", "role name")
+    first = Context("primary", "first")
+    second = Context("passing", "second")
+    active = Context("primary", "active")
+    closed = []
+
+    class Session(object):
+        def __init__(self, name, active_count=0, close_error=None):
+            self.name = name
+            self.active_trial_count = active_count
+            self.close_error = close_error
+
+        def close(self):
+            closed.append(self.name)
+            if self.close_error is not None:
+                raise self.close_error
+
+    pool = object.__new__(rdm_backend.RdmSessionPool)
+    pool.accepted_source = "old"
+    pool._sessions = {
+        first: Session("first", close_error=RuntimeError("first close")),
+        second: Session("second"),
+        active: Session("active", active_count=1),
+    }
+    pool._attempts = {first: 1, second: 1, active: 1}
+
+    with pytest.raises(RuntimeError, match="first close"):
+        pool.advance_accepted_source("new")
+
+    assert pool.accepted_source == "new"
+    assert closed == ["first", "second"]
+    assert set(pool._sessions) == {active}
+
+
+def test_document_reset_installs_fresh_pool_after_old_close_failure(monkeypatch):
+    created = []
+
+    class OldPool(object):
+        accepted_source = "latest accepted"
+
+        def close(self):
+            raise RuntimeError("old pool close failed")
+
+    class NewPool(object):
+        def __init__(self, primary_manager, accepted_source, target_policy, **kwargs):
+            self.primary_manager = primary_manager
+            self.accepted_source = accepted_source
+            self.target_policy = target_policy
+            created.append(self)
+
+    monkeypatch.setattr(rdm_backend, "RdmSessionPool", NewPool)
+    document = object.__new__(rdm_backend.RdmEvaluator)
+    document.primary_manager = ("primary",)
+    document.passing_manager = ("passing",)
+    document.target_policy = LegacyTargetPolicy(False, "TARGET")
+    document._restart_every = 7
+    document._client_factory = None
+    document._log = lambda *args, **kwargs: None
+    document._request_timeout = 3
+    document._disabled = {"context": "reason"}
+    document._compiler_versions = {"compiler": "9.2"}
+    document._context_probes = {"context": "probe"}
+    document._closed = False
+    document.pool = OldPool()
+
+    with pytest.raises(RuntimeError, match="old pool close failed"):
+        document.reset()
+
+    assert document.pool is created[0]
+    assert document.pool.accepted_source == "latest accepted"
+    assert document._disabled == {}
+    assert document._compiler_versions == {}
+    assert document._context_probes == {}
+
+
+def test_document_close_marks_closed_when_pool_close_fails():
+    class Pool(object):
+        def close(self):
+            raise RuntimeError("pool close failed")
+
+    document = object.__new__(rdm_backend.RdmEvaluator)
+    document.pool = Pool()
+    document._closed = False
+    with pytest.raises(RuntimeError, match="pool close failed"):
+        document.close()
+    assert document._closed
 
 
 def test_hybrid_passing_requires_strict_compiler_success():

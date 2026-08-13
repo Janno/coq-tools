@@ -302,6 +302,132 @@ def _candidate(old_source, source):
     return CandidateChange.from_sources(old_source, source)
 
 
+def test_ensure_final_hybrid_checkpoint_confirms_missing_baseline(
+    tmp_path
+):
+    primary = observation(ERROR_TARGET, 1, runtime=2.5, peak=25.0)
+    passing = observation("ok", 0, runtime=7.5, peak=75.0)
+    env, evaluator, coordinator = make_env(
+        tmp_path, [primary, passing], passing=True
+    )
+    output_path = tmp_path / "out.v"
+    output_path.write_text("old")
+    env["dynamic_header"] = (
+        "(* runtime %(recent_runtime)s rss %(recent_peak_rss_kb)s *)"
+    )
+    env["coqc_args"] = ("-final-primary",)
+    env["passing_coqc_args"] = ("-final-passing",)
+
+    checkpoint = find_bug.ensure_final_hybrid_checkpoint(
+        coordinator, str(output_path), **env
+    )
+    assert checkpoint is coordinator.last_checkpoint
+    assert checkpoint.raw_source == "old"
+    assert checkpoint.output_file_name == str(output_path)
+    assert checkpoint.primary_context.role == "primary"
+    assert checkpoint.primary_context.arguments == ("-final-primary",)
+    assert checkpoint.passing_context.role == "passing"
+    assert checkpoint.passing_context.arguments == ("-final-passing",)
+    assert "runtime 7.5 rss 75.0" in checkpoint.serialized_contents
+    assert output_path.read_bytes() == checkpoint.serialized_contents.replace(
+        "\n", os.linesep
+    ).encode("utf-8")
+    assert evaluator.finished == [(0, True), (1, True)]
+
+
+def test_ensure_final_hybrid_checkpoint_is_noop_when_one_exists(
+    tmp_path, monkeypatch
+):
+    coordinator = type("Coordinator", (), {})()
+    checkpoint = CandidateCheckpoint(
+        "raw", "serialized", "out.v", object(), None, object()
+    )
+    coordinator.last_checkpoint = checkpoint
+
+    monkeypatch.setattr(
+        find_bug,
+        "check_candidate_and_write_to_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("existing checkpoint must not be replaced")
+        ),
+    )
+    assert find_bug.ensure_final_hybrid_checkpoint(
+        coordinator, str(tmp_path / "missing.v")
+    ) is checkpoint
+
+
+def test_ensure_final_hybrid_checkpoint_rejects_disk_divergence(tmp_path):
+    env, evaluator, coordinator = make_env(tmp_path, [])
+    output_path = tmp_path / "out.v"
+    output_path.write_text("not the accepted raw source")
+    with pytest.raises(CandidateEvaluatorError, match="differs"):
+        find_bug.ensure_final_hybrid_checkpoint(
+            coordinator, str(output_path), **env
+        )
+    assert evaluator.begin_count == 0
+    assert coordinator.last_checkpoint is None
+
+
+def test_ensure_final_hybrid_checkpoint_failure_preserves_output(tmp_path):
+    env, evaluator, coordinator = make_env(
+        tmp_path, [observation(ERROR_OTHER, 1)]
+    )
+    output_path = tmp_path / "out.v"
+    output_path.write_text("old")
+    with pytest.raises(CandidateEvaluatorError, match="could not confirm"):
+        find_bug.ensure_final_hybrid_checkpoint(
+            coordinator, str(output_path), **env
+        )
+    assert output_path.read_text() == "old"
+    assert coordinator.last_checkpoint is None
+    assert evaluator.finished == [(0, False)]
+
+
+def test_fallback_exact_verification_failure_restores_original_output(
+    tmp_path, monkeypatch
+):
+    env, evaluator, coordinator = make_env(
+        tmp_path, [observation(ERROR_TARGET, 1, peak=0)]
+    )
+    env["header"] = "Timeout %(recent_peak_rss_kb).0f Check Set."
+    output_path = tmp_path / "out.v"
+    original_bytes = b"old"
+    output_path.write_bytes(original_bytes)
+
+    class Verifier(object):
+        def __init__(self, log, verbose_base=2):
+            pass
+
+        def begin_file(
+            self, context, source_file_name, source, target_policy=None
+        ):
+            assert source.startswith("(* -*- mode: coq;")
+            assert "Timeout 0 Check Set." in source
+            return EvaluationTrial(
+                Evaluation(EvaluationStatus.COMMAND_ERROR, ERROR_OTHER, (), 1),
+                None,
+                False,
+                False,
+            )
+
+        def finish(self, trial, accepted):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(find_bug, "CoqcEvaluator", Verifier)
+    with pytest.raises(CandidateEvaluatorError, match="primary compiler"):
+        find_bug.ensure_and_verify_final_hybrid_checkpoint(
+            coordinator, str(output_path), **env
+        )
+
+    assert output_path.read_bytes() == original_bytes
+    assert coordinator.last_checkpoint is None
+    assert coordinator.accepted_source == "old"
+    assert evaluator.finished == [(0, True)]
+
+
 def test_definition_change_emits_exact_statement_range():
     old = (
         {"statement": "Definition a := 0.\n"},

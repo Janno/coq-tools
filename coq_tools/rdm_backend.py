@@ -1812,9 +1812,19 @@ class RdmSessionPool(object):
     def advance_accepted_source(self, source):
         """Record a compiler-confirmed acceptance without a document trial."""
         self.accepted_source = source
+        first_error = None
         for context, session in tuple(self._sessions.items()):
             if not session.active_trial_count:
-                self._drop(context)
+                try:
+                    self._drop(context)
+                except BaseException as exc:
+                    # _drop removes pool ownership before closing the session.
+                    # Continue so one broken manager cannot retain other stale
+                    # inactive sessions after a compiler-confirmed acceptance.
+                    if first_error is None:
+                        first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def finish(self, trial, accepted):
         context = trial.session.context
@@ -2035,6 +2045,25 @@ class RdmEvaluator(object):
             except BaseException:
                 pass
 
+    def quarantine(self, context, reason, accepted_source=None):
+        """Disable one context and discard its state without raising.
+
+        Hybrid calls this only after compiler authority is settled.  Recording
+        an accepted source therefore precedes every best-effort cleanup step.
+        """
+        self._disabled[context] = str(reason)
+        if accepted_source is not None:
+            self.pool.accepted_source = accepted_source
+        try:
+            self.pool._drop(context)
+        except BaseException:
+            pass
+        if accepted_source is not None:
+            try:
+                self.pool.advance_accepted_source(accepted_source)
+            except BaseException:
+                pass
+
     def begin(self, context, candidate):
         if not isinstance(candidate, CandidateChange):
             raise TypeError("Document evaluator requires a CandidateChange")
@@ -2058,7 +2087,11 @@ class RdmEvaluator(object):
         if self._closed:
             raise RdmUnavailable("Document evaluator is closed")
         accepted_source = self.pool.accepted_source
-        self.pool.close()
+        cleanup_error = None
+        try:
+            self.pool.close()
+        except BaseException as exc:
+            cleanup_error = exc
         self._disabled.clear()
         self._compiler_versions.clear()
         self._context_probes.clear()
@@ -2072,12 +2105,16 @@ class RdmEvaluator(object):
             log=self._log,
             request_timeout=self._request_timeout,
         )
+        if cleanup_error is not None:
+            raise cleanup_error
 
     def close(self):
         if self._closed:
             return
-        self.pool.close()
-        self._closed = True
+        try:
+            self.pool.close()
+        finally:
+            self._closed = True
 
 
 class RdmOnlyEvaluator(CandidateEvaluator):
@@ -2746,11 +2783,10 @@ class RdmHybridEvaluator(CandidateEvaluator):
         compiler_verdict = None
         reason = self.document_evaluator.unsupported_reason(context)
         if reason is None:
-            try:
-                reason = self._ensure_reference_baseline(context, policy)
-            except BaseException as exc:
-                reason = "reference-baseline-unavailable: %s" % exc
-                self.document_evaluator.disable(context, reason)
+            # This probe is compiler-authoritative.  Compiler execution or
+            # finalization failures must remain fatal rather than being
+            # reclassified as optional document unavailability and retried.
+            reason = self._ensure_reference_baseline(context, policy)
         if reason is None:
             try:
                 document_trial = self.document_evaluator.begin(context, candidate)
@@ -2884,6 +2920,26 @@ class RdmHybridEvaluator(CandidateEvaluator):
             and token.compiler_verdict
         )
 
+    def _quarantine_after_document_failure(self, token, accepted, error):
+        reason = "finalization-failure: %s: %s" % (type(error).__name__, error)
+        try:
+            self.document_evaluator.quarantine(
+                token.context,
+                reason,
+                accepted_source=(token.source if accepted else None),
+            )
+        except BaseException:
+            pass
+        try:
+            self._log(
+                "rdm-hybrid optional document state discarded after %s "
+                "finalization failure on %s: %s"
+                % ("accepted" if accepted else "rejected", token.route, error),
+                level=1,
+            )
+        except BaseException:
+            pass
+
     def finish(self, trial, accepted):
         token = trial.token
         if not isinstance(token, HybridTrialToken):
@@ -2909,14 +2965,15 @@ class RdmHybridEvaluator(CandidateEvaluator):
                     except BaseException:
                         pass
                 raise
-        if token.document_trial is not None:
-            promote = bool(
-                accepted
-                and token.document_verdict
-                and token.compiler_verdict
-                and token.reason is None
-            )
-            try:
+
+        try:
+            if token.document_trial is not None:
+                promote = bool(
+                    accepted
+                    and token.document_verdict
+                    and token.compiler_verdict
+                    and token.reason is None
+                )
                 self.document_evaluator.finish(token.document_trial, promote)
                 if token.reason is not None:
                     self.document_evaluator.disable(
@@ -2924,23 +2981,13 @@ class RdmHybridEvaluator(CandidateEvaluator):
                     )
                 if accepted and not promote:
                     self.document_evaluator.advance_accepted_source(token.source)
-            except BaseException as exc:
-                if accepted:
-                    # The already-written compiler-confirmed source is the
-                    # recovery checkpoint even if document promotion was lost.
-                    try:
-                        self.document_evaluator.advance_accepted_source(token.source)
-                    except BaseException:
-                        pass
-                    self._log(
-                        "rdm-hybrid state discarded after promotion failure: %s"
-                        % exc,
-                        level=1,
-                    )
-                else:
-                    raise
-        elif accepted:
-            self.document_evaluator.advance_accepted_source(token.source)
+            elif accepted:
+                self.document_evaluator.advance_accepted_source(token.source)
+        except BaseException as exc:
+            # Compiler authority has already completed.  Optional document
+            # cleanup, promotion, and stale-session closure cannot change the
+            # accepted/rejected outcome or poison the coordinator lifecycle.
+            self._quarantine_after_document_failure(token, accepted, exc)
         if accepted:
             self._baseline_confirmed[token.context] = token.source
 
@@ -3029,21 +3076,33 @@ class RdmHybridEvaluator(CandidateEvaluator):
         try:
             self.document_evaluator.reset()
         except BaseException as exc:
-            self._log("rdm-hybrid reset failed: %s" % exc, level=1)
+            try:
+                self._log("rdm-hybrid reset failed: %s" % exc, level=1)
+            except BaseException:
+                pass
 
     def close(self):
         if self._closed:
             return
-        first_error = None
+        document_error = None
+        compiler_error = None
         try:
             self.document_evaluator.close()
         except BaseException as exc:
-            first_error = exc
+            document_error = exc
         try:
             self.compiler_evaluator.close()
         except BaseException as exc:
-            if first_error is None:
-                first_error = exc
+            compiler_error = exc
         self._closed = True
-        if first_error is not None:
-            raise first_error
+        if document_error is not None:
+            try:
+                self._log(
+                    "rdm-hybrid ignored optional document close failure: %s"
+                    % document_error,
+                    level=1,
+                )
+            except BaseException:
+                pass
+        if compiler_error is not None:
+            raise compiler_error
